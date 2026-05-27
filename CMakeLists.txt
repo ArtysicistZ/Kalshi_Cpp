@@ -69,6 +69,11 @@ target_include_directories(test_spsc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_spsc PRIVATE GTest::gtest_main)
 add_test(NAME test_spsc COMMAND test_spsc)
 
+add_executable(test_pool test/test_pool.cpp)
+target_include_directories(test_pool PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_pool PRIVATE GTest::gtest_main)
+add_test(NAME test_pool COMMAND test_pool)
+
 # add_executable(test_book test/test_book.cpp)
 # target_include_directories(test_book PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # target_link_libraries(test_book PRIVATE GTest::gtest_main)
@@ -83,6 +88,10 @@ add_test(NAME test_spsc COMMAND test_spsc)
 add_executable(bench_spsc bench/bench_spsc.cpp)
 target_include_directories(bench_spsc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_spsc PRIVATE benchmark::benchmark_main)
+
+add_executable(bench_pool bench/bench_pool.cpp)
+target_include_directories(bench_pool PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_pool PRIVATE benchmark::benchmark_main)
 
 # add_executable(bench_allocator bench/bench_allocator.cpp)
 # target_include_directories(bench_allocator PRIVATE ${CMAKE_SOURCE_DIR}/src)

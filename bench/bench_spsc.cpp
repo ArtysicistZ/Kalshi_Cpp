@@ -1,6 +1,8 @@
 #include <benchmark/benchmark.h>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <queue>
 #include "core/spsc_queue.h"
 
 using kalshi::SPSCQueue;
@@ -158,3 +160,65 @@ static void BM_CrossThread_RTT(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * rounds);
 }
 BENCHMARK(BM_CrossThread_RTT)->Unit(benchmark::kNanosecond);
+
+// ── std::queue comparisons ──
+
+// Plain std::queue, no thread safety. Lowest-overhead STL baseline.
+// Each push allocates a deque chunk (~once per ~512 elements amortized).
+static void BM_StdQueue_PushPop(benchmark::State& state) {
+    std::queue<int> q;
+    for (auto _ : state) {
+        q.push(42);
+        q.pop();
+    }
+}
+BENCHMARK(BM_StdQueue_PushPop);
+
+// std::queue + mutex — the "naive thread-safe" approach.
+// This is what you'd write if you didn't know about lock-free queues.
+// Single-thread benchmark — pays mutex cost without any contention.
+static void BM_StdQueueMutex_PushPop(benchmark::State& state) {
+    std::queue<int> q;
+    std::mutex m;
+    for (auto _ : state) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            q.push(42);
+        }
+        {
+            std::lock_guard<std::mutex> lock(m);
+            q.pop();
+        }
+    }
+}
+BENCHMARK(BM_StdQueueMutex_PushPop);
+
+// std::queue + mutex, two threads — shows mutex contention cost.
+// This is the apples-to-apples comparison vs SPSC cross-thread throughput.
+static void BM_StdQueueMutex_CrossThread(benchmark::State& state) {
+    const int64_t items_per_iter = 100000;
+    std::queue<int64_t> q;
+    std::mutex m;
+
+    for (auto _ : state) {
+        std::thread consumer([&] {
+            int64_t count = 0;
+            while (count < items_per_iter) {
+                std::lock_guard<std::mutex> lock(m);
+                if (!q.empty()) {
+                    q.pop();
+                    ++count;
+                }
+            }
+        });
+
+        for (int64_t i = 0; i < items_per_iter; ++i) {
+            std::lock_guard<std::mutex> lock(m);
+            q.push(i);
+        }
+
+        consumer.join();
+    }
+    state.SetItemsProcessed(state.iterations() * items_per_iter);
+}
+BENCHMARK(BM_StdQueueMutex_CrossThread)->Unit(benchmark::kMicrosecond);

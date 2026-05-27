@@ -154,7 +154,7 @@ kalshi-cpp/
 - **Pool allocator**: fixed-size blocks for Order objects.
   - Intrusive free-list through the blocks themselves (no separate node allocation).
   - O(1) allocate (pop), O(1) deallocate (push).
-  - Inherits from `std::pmr::memory_resource` so it can plug into any STL container that wants pool-backed allocations.
+  - **No pmr inheritance**: no consumer in the codebase uses STL containers backed by the pool (the order map is `FlatHashMap`, not `std::pmr::unordered_map`). Skipping pmr saves ~15 lines, one vtable pointer, and indirect virtual calls. Trivial to add back later if needed.
 - **Flat hash map**: open-addressing, fixed-capacity, linear probing with backshift deletion. Replaces `std::pmr::unordered_map` for order lookups.
   - Template `FlatHashMap<Key, Value, Capacity>` where `Capacity` is a power of two.
   - Default sizing for Kalshi: `Capacity = 524288` (2^19) — supports the full 200K open-order API limit at ~39% load factor, fits in 8 MB.
