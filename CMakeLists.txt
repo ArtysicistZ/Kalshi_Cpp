@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Release flags (applied only with -DCMAKE_BUILD_TYPE=Release) ──
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto -fno-exceptions -fno-rtti")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -flto -fno-exceptions -fno-rtti")
 
 # ── MSYS2 paths (help CMake find libraries installed via pacman) ──
 if(MINGW)

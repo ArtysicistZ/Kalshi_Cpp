@@ -1,5 +1,7 @@
 #include <benchmark/benchmark.h>
+#include <algorithm>
 #include <cstdint>
+#include <random>
 #include <unordered_map>
 #include <vector>
 #include "core/flat_hash_map.h"
@@ -103,6 +105,84 @@ static void BM_UnorderedMap_FindMiss(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_UnorderedMap_FindMiss);
+
+// ── Find hit — random access ──
+// Sequential lookups let the L2 prefetcher do most of the work, which masks
+// real lookup latency and disproportionately favors maps with small working
+// sets. Random access defeats the prefetcher, exposing actual per-find cost.
+
+static void BM_FlatMap_FindHit_Random(benchmark::State& state) {
+    FlatHashMap<uint64_t, uint64_t, CAPACITY> map;
+    for (uint64_t i = 0; i < LIVE; ++i) map.insert(i, i * 7);
+
+    std::vector<uint64_t> keys(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) keys[i] = i;
+    std::shuffle(keys.begin(), keys.end(), std::mt19937_64{0xC0FFEEULL});
+
+    size_t idx = 0;
+    for (auto _ : state) {
+        uint64_t* v = map.find(keys[idx]);
+        benchmark::DoNotOptimize(v);
+        idx = (idx + 1) % LIVE;
+    }
+}
+BENCHMARK(BM_FlatMap_FindHit_Random);
+
+static void BM_UnorderedMap_FindHit_Random(benchmark::State& state) {
+    std::unordered_map<uint64_t, uint64_t> map;
+    map.reserve(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) map.insert({i, i * 7});
+
+    std::vector<uint64_t> keys(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) keys[i] = i;
+    std::shuffle(keys.begin(), keys.end(), std::mt19937_64{0xC0FFEEULL});
+
+    size_t idx = 0;
+    for (auto _ : state) {
+        auto it = map.find(keys[idx]);
+        benchmark::DoNotOptimize(it);
+        idx = (idx + 1) % LIVE;
+    }
+}
+BENCHMARK(BM_UnorderedMap_FindHit_Random);
+
+// ── Find miss — random access ──
+// Same as above but with keys guaranteed absent from the map.
+
+static void BM_FlatMap_FindMiss_Random(benchmark::State& state) {
+    FlatHashMap<uint64_t, uint64_t, CAPACITY> map;
+    for (uint64_t i = 0; i < LIVE; ++i) map.insert(i, i * 7);
+
+    std::vector<uint64_t> miss_keys(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) miss_keys[i] = LIVE + i;     // absent
+    std::shuffle(miss_keys.begin(), miss_keys.end(), std::mt19937_64{0xC0FFEEULL});
+
+    size_t idx = 0;
+    for (auto _ : state) {
+        uint64_t* v = map.find(miss_keys[idx]);
+        benchmark::DoNotOptimize(v);
+        idx = (idx + 1) % LIVE;
+    }
+}
+BENCHMARK(BM_FlatMap_FindMiss_Random);
+
+static void BM_UnorderedMap_FindMiss_Random(benchmark::State& state) {
+    std::unordered_map<uint64_t, uint64_t> map;
+    map.reserve(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) map.insert({i, i * 7});
+
+    std::vector<uint64_t> miss_keys(LIVE);
+    for (uint64_t i = 0; i < LIVE; ++i) miss_keys[i] = LIVE + i;
+    std::shuffle(miss_keys.begin(), miss_keys.end(), std::mt19937_64{0xC0FFEEULL});
+
+    size_t idx = 0;
+    for (auto _ : state) {
+        auto it = map.find(miss_keys[idx]);
+        benchmark::DoNotOptimize(it);
+        idx = (idx + 1) % LIVE;
+    }
+}
+BENCHMARK(BM_UnorderedMap_FindMiss_Random);
 
 // ── Churning (the realistic order-book pattern) ──
 // Steady-state: LIVE entries always resident. Each iteration erases the
