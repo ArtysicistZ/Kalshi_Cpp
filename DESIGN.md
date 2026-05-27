@@ -6,35 +6,48 @@ Low-latency prediction market trading client in C++20. Connects to Kalshi's WebS
 
 There is no C++ client for any prediction market. Every existing Kalshi/Polymarket client is Python, TypeScript, or Go. This project fills that gap while demonstrating the systems programming techniques used in production trading infrastructure: async networking, lock-free queues, arena/pool allocators, CPU pinning, and nanosecond-resolution latency measurement.
 
+To avoid the KYC/SSN requirements of Kalshi's regulated demo environment and to enable reproducible, controllable testing, this project also includes a **conformant exchange simulator** (`kalshi-sim`) that speaks Kalshi's wire protocol (RSA-PSS-signed REST + WebSocket market data feed). Both ends — client and simulator — are written in C++ and optimized. The sim lets us drive adversarial scenarios (latency spikes, partial fills, network drops, sequence-number gaps) on demand, and runs end-to-end benchmarks under realistic conditions injected via `tc netem`.
+
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │              kalshi-cpp                      │
-                    │                                             │
-  Kalshi WSS ──────>│  ┌──────────┐  SPSC Queue  ┌────────────┐  │
-                    │  │ Network  │ ────────────> │  Strategy  │  │
-  Kalshi REST <────>│  │ Thread   │              │  Thread    │  │
-                    │  │          │  SPSC Queue  │            │  │
-                    │  │ Asio I/O │ <──────────── │ Order Mgr  │  │
-                    │  │ (Note 1) │              │ + Book     │  │
-                    │  └──────────┘              └────────────┘  │
-                    │       │                          │         │
-                    │       v                          v         │
-                    │  ┌──────────────────────────────────────┐  │
-                    │  │         Latency Logger (rdtsc)       │  │
-                    │  │    tick-to-process, tick-to-order     │  │
-                    │  │    p50 / p99 / p999 histograms        │  │
-                    │  └──────────────────────────────────────┘  │
-                    │                                             │
-                    │  Memory: Arena (msg parse) + Pool (orders)  │
-                    │  OS: CPU pin, huge pages, mlockall, FIFO    │
-                    └─────────────────────────────────────────────┘
-
-Note 1: Boost.Asio abstracts the I/O backend. On Linux: epoll (default) or
-io_uring (Asio 1.80+/Boost 1.80+ with BOOST_ASIO_HAS_IO_URING). On Windows:
-IOCP. The code is identical — Asio selects the best backend at compile time.
+   ┌──────────────────────────────┐         ┌──────────────────────────────┐
+   │       kalshi-cpp client      │         │       kalshi-sim  server     │
+   │                              │         │                              │
+   │  ┌──────────┐                │   WSS   │              ┌────────────┐  │
+   │  │ Network  │ ─── orders ──> │ ──────> │ ──── feed ── │ Matching   │  │
+   │  │ Thread   │                │  REST   │              │ Engine     │  │
+   │  │          │ <── fills ──── │ <────── │ ── replies ─>│ + Auth Ver │  │
+   │  │  io_uring│                │ TLS+PSS │              │            │  │
+   │  └──────────┘                │  signed │              └────────────┘  │
+   │       │                      │         │                    │         │
+   │       │ SPSC                 │         │                    │         │
+   │       v                      │         │                    v         │
+   │  ┌────────────┐              │         │   ┌──────────────────────┐   │
+   │  │  Strategy  │              │         │   │  scenario injection: │   │
+   │  │  Order Mgr │              │         │   │  latency, drops,     │   │
+   │  │  Book      │              │         │   │  partial fills,      │   │
+   │  └────────────┘              │         │   │  seq gaps            │   │
+   │       │                      │         │   └──────────────────────┘   │
+   │       v                      │         │                              │
+   │  ┌──────────────────────┐    │         │  CPU pin, NODELAY, busy poll │
+   │  │  Latency Logger      │    │         └──────────────────────────────┘
+   │  │  (rdtsc, p50/p99)    │    │                          │
+   │  └──────────────────────┘    │                          │
+   │                              │            tc netem on loopback adds
+   │  Memory: Arena + Pool        │            realistic latency + jitter
+   │  OS: CPU pin, huge pages,    │            (100 µs RTT, 0.1% loss)
+   │      mlockall, FIFO          │
+   └──────────────────────────────┘
 ```
+
+**Two processes, identical low-latency techniques on both sides:**
+- **Client (`kalshi-cpp`)** — two threads (network + strategy) connected by lock-free SPSC queues. Sends signed REST orders, consumes WS market data feed.
+- **Simulator (`kalshi-sim`)** — verifies signatures with the public key, replays/generates market data over WS, runs a CLOB matching engine, supports scenario-injection knobs (delay, drops, partial fills) over a control channel.
+
+**Latency realism on a single host**: `tc qdisc add dev lo root netem delay 100us 20us` injects realistic LAN-class delay + jitter on the loopback interface, so end-to-end measurements are comparable to a real colocated deployment.
+
+**I/O backend**: Boost.Asio abstracts the kernel interface — `io_uring` on Linux 5.15+, `epoll` fallback. On Windows: IOCP. Code is identical; Asio picks at compile time.
 
 **Two threads, no locks:**
 - **Network thread**: owns the WebSocket connection, parses incoming JSON, pushes parsed market data into an SPSC queue. Also sends outbound orders received from the strategy thread's SPSC queue.
@@ -69,41 +82,66 @@ The codebase uses POSIX/Linux APIs for OS-level tuning (Phase 4). These have Win
 kalshi-cpp/
 ├── CMakeLists.txt
 ├── DESIGN.md
-├── src/
+├── src/                            # Client process
 │   ├── main.cpp
-│   ├── net/                  # Networking layer
-│   │   ├── ws_client.h/cpp       # WebSocket client (Boost.Beast)
-│   │   ├── ws_reconnect.h/cpp    # Reconnection state machine + backoff
-│   │   ├── rest_client.h/cpp     # REST client (order placement)
-│   │   ├── rate_limiter.h        # Token-bucket rate limiter (mirrors Kalshi tiers)
-│   │   └── auth.h/cpp            # RSA-PSS SHA256 signing
-│   ├── feed/                 # Market data processing
-│   │   ├── parser.h/cpp          # JSON -> internal structs
-│   │   └── book.h/cpp            # Order book reconstruction
-│   ├── core/                 # Low-latency primitives
-│   │   ├── spsc_queue.h          # Lock-free SPSC ring buffer
-│   │   ├── arena_alloc.h         # Arena (bump) allocator
-│   │   ├── pool_alloc.h          # Fixed-size pool allocator
-│   │   ├── flat_hash_map.h       # Open-addressing fixed-capacity hash map
-│   │   └── clock.h               # rdtsc + calibration
-│   ├── strategy/             # Trading logic
-│   │   ├── signal.h/cpp          # Signal generation
-│   │   └── order_manager.h/cpp   # Order lifecycle
-│   ├── system/               # OS-level optimization
-│   │   └── tuning.h/cpp          # CPU pin, huge pages, mlockall
+│   ├── net/                        # Networking layer
+│   │   ├── ws_client.h/cpp             # WebSocket client (Boost.Beast)
+│   │   ├── ws_reconnect.h/cpp          # Reconnection state machine + backoff
+│   │   ├── rest_client.h/cpp           # REST client (order placement)
+│   │   ├── rate_limiter.h              # Token-bucket rate limiter (mirrors Kalshi tiers)
+│   │   ├── sockopt.h/cpp               # NODELAY / busy-poll / QUICKACK / buf sizing
+│   │   └── auth.h/cpp                  # RSA-PSS SHA256 signing
+│   ├── feed/                       # Market data processing
+│   │   ├── parser.h/cpp                # JSON -> internal structs (simdjson)
+│   │   └── book.h/cpp                  # Order book reconstruction
+│   ├── core/                       # Low-latency primitives (DONE)
+│   │   ├── spsc_queue.h                # Lock-free SPSC ring buffer
+│   │   ├── arena_alloc.h               # Arena (bump) allocator
+│   │   ├── pool_alloc.h                # Fixed-size pool allocator
+│   │   ├── flat_hash_map.h             # Robin Hood open-addressing hash map
+│   │   └── clock.h                     # rdtsc + calibration
+│   ├── strategy/                   # Trading logic
+│   │   ├── signal.h/cpp                # Signal generation
+│   │   └── order_manager.h/cpp         # Order lifecycle
+│   ├── system/                     # OS-level optimization
+│   │   └── tuning.h/cpp                # CPU pin, huge pages, mlockall, SCHED_FIFO
 │   └── util/
-│       ├── log.h                 # Lock-free logging
-│       └── histogram.h           # Latency percentile tracking
-├── bench/                    # Micro-benchmarks
-│   ├── bench_spsc.cpp
-│   ├── bench_allocator.cpp
-│   └── bench_parser.cpp
-├── test/                     # Unit tests
-│   ├── test_spsc.cpp
+│       ├── log.h                       # Lock-free logging
+│       └── histogram.h                 # Latency percentile tracking (HDR)
+├── sim/                            # Exchange simulator `kalshi-sim` (Phase 5)
+│   ├── main.cpp                        # Server entrypoint, arg parsing
+│   ├── rest_server.h/cpp               # HTTPS server (Beast); endpoint dispatch
+│   ├── ws_server.h/cpp                 # WS feed (replay + generative modes)
+│   ├── auth_verify.h/cpp               # EVP_DigestVerify against registered pubkeys
+│   ├── matching_engine.h/cpp           # CLOB, price-time priority
+│   ├── scenario.h/cpp                  # /sim/* control endpoint (inject delay etc.)
+│   └── replay/                         # Captured Kalshi payload samples
+│       └── *.json
+├── bench/                          # Micro-benchmarks
+│   ├── bench_spsc.cpp                  # DONE
+│   ├── bench_pool.cpp                  # DONE
+│   ├── bench_flat_hash_map.cpp         # DONE
+│   ├── bench_arena.cpp
+│   ├── bench_parser.cpp                # simdjson vs nlohmann
+│   ├── bench_book.cpp                  # orderbook_delta apply latency
+│   └── bench_e2e.cpp                   # tick-to-trade against kalshi-sim under tc netem
+├── test/                           # Unit tests
+│   ├── test_spsc.cpp                   # DONE
+│   ├── test_pool.cpp                   # DONE
+│   ├── test_flat_hash_map.cpp          # DONE
+│   ├── test_auth.cpp                   # Self-test + Kalshi reference vector
 │   ├── test_book.cpp
-│   └── test_auth.cpp
-└── scripts/
-    └── isolate_cpus.sh           # CPU isolation helper
+│   ├── test_parser.cpp
+│   └── test_matching.cpp               # kalshi-sim CLOB correctness
+├── scripts/
+│   ├── isolate_cpus.sh                 # CPU isolation helper
+│   ├── netem_colocated.sh              # tc netem: ~5 us RTT
+│   ├── netem_lan.sh                    # tc netem: ~100 us RTT, ±20 us jitter
+│   ├── netem_wan.sh                    # tc netem: 1 ms RTT, 0.1% loss
+│   └── netem_clear.sh                  # tc qdisc del
+└── docs/
+    ├── PRODUCTION_TUNING.md            # Kernel-bypass NIC path (Solarflare/DPDK)
+    └── BENCHMARK_RESULTS.md            # Per-knob latency ablation table
 ```
 
 **1.2 Kalshi auth + REST client**
@@ -111,21 +149,19 @@ kalshi-cpp/
 - Signature message format: `{timestamp_ms}{HTTP_METHOD}{path}` (path only, no host or query params)
 - Three headers per request: `KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP` (ms), `KALSHI-ACCESS-SIGNATURE` (Base64)
 - REST client for account info, market listing, order placement
-- Base URLs:
-  - Demo: `https://external-api.demo.kalshi.co/trade-api/v2`
-  - Production: `https://external-api.kalshi.com/trade-api/v2`
-- Target: successfully authenticate and fetch market list from Kalshi demo API
+- **Auth testing**: round-trip self-test using a locally generated throwaway RSA keypair — sign with private key, verify with matching public key via `EVP_DigestVerify*`. No Kalshi credentials needed.
+- **Reference vector test**: cross-check against the Kalshi Python SDK's signing output for a fixed (key, message) pair to prove byte-identical conformance with Kalshi's wire format.
+- Base URL: configurable at runtime via `KALSHI_API_BASE` env var. Defaults to local simulator (`http://127.0.0.1:8443`); same code works against real Kalshi for anyone with credentials.
+- Target: signature self-test passes, reference vector matches Python SDK byte-for-byte.
 
 **1.3 WebSocket client**
 - Boost.Beast WebSocket with TLS (Boost.Asio + OpenSSL)
 - `TCP_NODELAY` enabled
 - Auth headers (`KALSHI-ACCESS-KEY/TIMESTAMP/SIGNATURE`) sent during HTTP upgrade handshake; signed path is always `GET/trade-api/ws/v2`
-- WebSocket URLs:
-  - Demo: `wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2`
-  - Production: `wss://external-api-ws.kalshi.com/trade-api/ws/v2`
+- WebSocket URL: configurable via `KALSHI_WS_URL` env var; defaults to local simulator (`ws://127.0.0.1:8444/trade-api/ws/v2`).
 - Subscribe to `orderbook_delta`, `ticker`, `trade` channels
 - Parse incoming JSON with simdjson (2-4x faster than nlohmann/json)
-- Target: print live market data from Kalshi demo
+- Target: consume a captured Kalshi feed replayed by the simulator (Phase 5), print parsed orderbook deltas.
 
 **1.4 WebSocket reconnection**
 - Connections drop: server maintenance (Thursdays 3-5 AM ET), network blips, idle timeouts
@@ -201,25 +237,61 @@ kalshi-cpp/
 - Cancel stale orders on book updates
 - Not meant to be profitable; meant to demonstrate the full order lifecycle
 
-### Phase 4: OS-Level Optimization (Week 5-6)
+### Phase 4: OS- and Network-Level Optimization (Week 5-6)
+
+Each subsection below ships with a before/after benchmark. The story is not "tuned values" but "measured per-knob latency contributions."
 
 **4.1 Thread tuning**
 - `sched_setaffinity()`: pin network thread to core 1, strategy thread to core 2. Avoid core 0 (handles hardware interrupts by default on most Linux kernels).
 - `sched_setscheduler(SCHED_FIFO)`: real-time priority to avoid preemption. Requires `CAP_SYS_NICE` or root. If the thread has a bug and never yields (blocks on I/O or sleeps), it will starve other processes on that core.
 - `mlockall(MCL_CURRENT | MCL_FUTURE)`: prevent page faults after startup. Without this, rarely-accessed pages can be swapped out; re-accessing them incurs ~10-100us page fault latency.
+- **Isolated CPUs** (`isolcpus=1,2` kernel cmdline) — exclude trading cores from the general scheduler entirely. Documented as a deployment-time setting; not required for the benchmark suite.
 
 **4.2 Memory tuning**
 - Huge pages via `mmap(MAP_HUGETLB)` for arena and pool backing memory
 - `madvise(MADV_HUGEPAGE)` for transparent huge pages on the order book array
 - Pre-fault all pages at startup (touch every page to avoid runtime faults)
 
-**4.3 Compiler tuning**
+**4.3 Socket-level network tuning**
+- **`TCP_NODELAY`** — disables Nagle's algorithm so single-message orders ship immediately. Expected ~5-10× latency improvement on small writes.
+- **`SO_BUSY_POLL`** (Linux) — kernel busy-polls the NIC for incoming packets instead of waiting on interrupts. Cuts wakeup latency from ~20 µs to ~3-5 µs at the cost of one core's worth of CPU.
+- **`TCP_QUICKACK`** — disable delayed ACKs on the receive side; reduces tail latency on the ack path.
+- **`SO_RCVBUF` / `SO_SNDBUF`** sized large at startup to avoid kernel-side growth mid-stream.
+- **`io_uring` backend** (Boost.Asio with `BOOST_ASIO_HAS_IO_URING`) — submission-queue/completion-queue model, syscall-free in the steady state. Expected 30-50% latency win on the receive path vs `epoll`.
+- Bench plan: side-by-side comparison of {default sockopts, `TCP_NODELAY`, `+SO_BUSY_POLL`, `+io_uring`} configurations measured end-to-end against the simulator.
+
+**4.4 Realistic network conditions via `tc netem`**
+Loopback is too fast (~5 µs RTT) to be representative. We inject realistic conditions on the loopback interface using Linux's network emulator:
+```bash
+# Colocated trading link (~5 µs RTT, low jitter) — what HFT customers actually pay for
+sudo tc qdisc add dev lo root netem delay 5us 1us
+
+# LAN-class (~100 µs base, ±20 µs jitter)
+sudo tc qdisc replace dev lo root netem delay 100us 20us
+
+# Lossy WAN (0.1% drop, 1 ms base)
+sudo tc qdisc replace dev lo root netem delay 1ms loss 0.1%
+
+# Remove all rules
+sudo tc qdisc del dev lo root
+```
+Every Phase 4 benchmark is run under each profile, so we can show how each optimization scales as the underlying transport gets slower or noisier.
+
+**4.5 Production-only optimizations (documented, not implemented)**
+Kernel-bypass and NIC-specific paths require physical hardware:
+- **Solarflare OpenOnload / `ef_vi`**, **Mellanox `ibverbs`/`rdma`**, or **DPDK** — packets bypass the kernel and land directly in userspace, ~1 µs round trip vs ~15 µs through the kernel stack.
+- **NIC hardware timestamping** for nanosecond-accurate wire timestamps.
+- **PTP/PPS clock sync** for cross-host time alignment.
+
+These are described in `docs/PRODUCTION_TUNING.md` with the specific API/sockopt changes that would be needed at deployment time. Interviewers care that you know the path; the loopback-vs-`netem` measurement framework is what would let you actually validate the gain once hardware is available.
+
+**4.6 Compiler tuning**
 - `-O3 -march=native -flto`: aggressive optimization + link-time optimization
 - `-fno-exceptions -fno-rtti`: eliminate exception handling overhead on hot path
 - **`-fno-exceptions` + Boost.Beast compatibility**: Beast throws exceptions in some error paths by default. All async operations must use the `error_code` overloads (e.g., `async_read(ws, buffer, yield[ec])` instead of the throwing variant). Audit every Beast/Asio call to ensure no throwing path is reachable — an uncaught exception with `-fno-exceptions` calls `std::abort()`.
-- Profile-guided optimization (PGO): compile with `-fprofile-generate`, run against live demo feed, recompile with `-fprofile-use`
+- Profile-guided optimization (PGO): compile with `-fprofile-generate`, run against the simulator feed under load, recompile with `-fprofile-use`.
 
-**4.4 Latency measurement**
+**4.7 Latency measurement**
 - `rdtsc` inline assembly for nanosecond timestamps
 - Calibrate TSC frequency against `clock_gettime(CLOCK_MONOTONIC)` at startup
 - Record timestamps at: WebSocket recv, parse complete, book updated, order sent
@@ -230,9 +302,46 @@ kalshi-cpp/
   - **Tick-to-order**: time from market data arrival to order submission
   - **Allocator latency**: arena alloc vs malloc comparison
 
-### Phase 5: Benchmarking + Documentation (Week 6)
+### Phase 5: Exchange Simulator — `kalshi-sim` (Week 6-7)
 
-**5.1 Micro-benchmarks (Google Benchmark)**
+A conformant Kalshi-protocol server, written in C++ for both correctness and apples-to-apples measurement. The simulator lets the client be benchmarked end-to-end without giving SSN to a regulated exchange, and unlocks adversarial-scenario testing that no real exchange would permit.
+
+**5.1 REST server**
+- Boost.Beast HTTPS server on `127.0.0.1:8443` (self-signed cert for TLS).
+- Verifies the three `KALSHI-ACCESS-*` headers on every request:
+  - Parses `KALSHI-ACCESS-KEY` UUID against the registered set.
+  - Reconstructs the signing message `{timestamp}{method}{path}` and verifies `KALSHI-ACCESS-SIGNATURE` against the client's registered public key via `EVP_DigestVerify*`.
+  - Rejects with 401 on signature mismatch, ±5 s timestamp skew, or unknown key.
+- Implements endpoints: `GET /exchange/status`, `GET /portfolio/balance`, `POST /portfolio/orders`, `DELETE /portfolio/orders/{id}`.
+
+**5.2 WebSocket feed**
+- Boost.Beast WebSocket server on `127.0.0.1:8444`.
+- Two modes:
+  1. **Replay mode**: streams captured Kalshi feed payloads (recorded from public docs examples + simulated extensions) at recorded inter-message intervals.
+  2. **Generative mode**: synthetic market-data generator (random walks with controlled volatility, configurable book depth) to drive load testing.
+- Honors sequence numbers per subscription; supports `BookSnapshot` on (re)subscribe.
+
+**5.3 Matching engine**
+- Price-time priority CLOB, one book per market.
+- Uses the same `FlatHashMap` from `core/` for order ID → Order* indexing.
+- Limit, IOC, FOK, GTC support; matches against resting book, emits `trade` and `orderbook_delta` to all subscribers.
+
+**5.4 Scenario injection (control channel)**
+A separate localhost-only HTTP control endpoint exposes knobs that no real exchange would offer:
+- `POST /sim/inject_delay {ms}` — stall responses for N ms.
+- `POST /sim/drop_connection` — force-close the client's WS.
+- `POST /sim/partial_fill_rate {0.0-1.0}` — fraction of orders to partial-fill.
+- `POST /sim/inject_seq_gap` — skip a sequence number to trigger client's gap-detection / snapshot-request path.
+- `POST /sim/rate_limit_burst` — simulate 429 throttle.
+
+These let benchmarks measure how the client's reconnection FSM, snapshot-replay logic, and rate-limiter behave under adversarial conditions — work that's both unique and impossible to demonstrate against a live exchange.
+
+**5.5 Simulator-side optimization**
+Same low-latency techniques apply on the server side too: CPU pinning, `TCP_NODELAY`, `io_uring`, pool-allocated orders. This is what makes the end-to-end numbers meaningful — both sides are tuned, so the measured tick-to-trade latency reflects the protocol and network stack, not server-side sloppiness.
+
+### Phase 6: Benchmarking + Documentation (Week 7)
+
+**6.1 Micro-benchmarks (Google Benchmark)**
 - SPSC queue: ops/sec, RTT latency at various batch sizes
 - Arena allocator vs `malloc`: allocation latency histogram
 - Pool allocator vs `new`: allocation + deallocation cycle
@@ -240,16 +349,20 @@ kalshi-cpp/
 - simdjson vs nlohmann/json: parse latency per message
 - Order book update: nanoseconds per `orderbook_delta` apply
 
-**5.2 System benchmarks**
-- End-to-end tick-to-order latency under sustained load
-- Latency stability: demonstrate no jitter spikes from malloc/page faults
+**6.2 System benchmarks (against `kalshi-sim`)**
+- End-to-end tick-to-order latency under sustained load, reported as p50 / p99 / p999 / max
+- Tail-latency profile under each `tc netem` condition (colocated / LAN / lossy WAN)
+- Per-knob ablation: which sockopt / kernel-bypass option contributed how many µs
+- Latency stability: demonstrate no jitter spikes from malloc/page faults across an N-minute run
 - Memory usage: peak RSS, allocation count verification (should be 0 on hot path)
+- Adversarial-scenario tests: recovery time after forced WS drop, behavior under injected sequence gap, throttle-storm absorption
 
-**5.3 Documentation**
-- Architecture diagram with data flow
-- Latency results table with percentiles
+**6.3 Documentation**
+- Architecture diagram with data flow (client + `kalshi-sim`)
+- Latency results table with percentiles, per network profile
 - Explanation of each optimization and its measured impact
-- Build and run instructions
+- `docs/PRODUCTION_TUNING.md`: what would change in real production (kernel-bypass, hardware timestamping, NIC sockopt) with expected gains based on vendor data
+- Build and run instructions for both `kalshi-cpp` and `kalshi-sim`
 
 ## Key Dependencies
 
@@ -297,29 +410,41 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto -fno-exceptions -fno-rtti")
 ```
 
-## Kalshi Demo Setup
+## Local Development Setup
 
-Demo and production are fully isolated — keys and accounts do not cross environments.
+Default flow runs entirely against `kalshi-sim` — no Kalshi account, no SSN, no KYC. The client uses a locally generated throwaway RSA keypair; the simulator is registered with the matching public key.
 
-1. Create account at [demo.kalshi.co](https://demo.kalshi.co)
-2. Generate RSA key pair:
+1. Generate a throwaway RSA keypair (outside the repo so it's never committed):
    ```bash
-   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out kalshi_private.pem
+   mkdir -p ~/.kalshi
+   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ~/.kalshi/dev_private.pem
+   openssl rsa -in ~/.kalshi/dev_private.pem -pubout -out ~/.kalshi/dev_public.pem
+   chmod 600 ~/.kalshi/dev_private.pem
    ```
-3. Extract public key:
+2. Generate a dummy access key ID (any UUID works — used to identify the client to `kalshi-sim`):
    ```bash
-   openssl rsa -in kalshi_private.pem -pubout -out kalshi_public.pem
+   uuidgen > ~/.kalshi/dev_key_id
    ```
-4. Upload public key in the Kalshi demo dashboard (Account > API Keys)
-5. Copy the API Key ID (UUID) from the dashboard
-6. Set env vars:
+3. Set env vars (put in `~/.bashrc` for persistence):
    ```bash
-   export KALSHI_API_KEY="your-api-key-uuid"
-   export KALSHI_PRIVATE_KEY_PATH="./kalshi_private.pem"
+   export KALSHI_KEY_ID="$(cat ~/.kalshi/dev_key_id)"
+   export KALSHI_KEY_PATH="$HOME/.kalshi/dev_private.pem"
+   export KALSHI_API_BASE="http://127.0.0.1:8443"
+   export KALSHI_WS_URL="ws://127.0.0.1:8444/trade-api/ws/v2"
    ```
-7. Run: `./kalshi-cpp --demo`
+4. Add `.kalshi/`, `*.pem`, `*.key` to `.gitignore` (belt-and-suspenders; keys already live outside the repo).
+5. Start the simulator first, then the client:
+   ```bash
+   # terminal 1 — register the public key with kalshi-sim and start the server
+   ./build/kalshi-sim --register ~/.kalshi/dev_public.pem --key-id "$KALSHI_KEY_ID"
+   
+   # terminal 2 — start the client
+   ./build/kalshi-cpp
+   ```
 
-**Maintenance window**: Kalshi pauses trading every Thursday 3:00-5:00 AM ET. WebSocket connections may drop. Orders with `cancel_order_on_pause=true` are auto-cancelled.
+To run against real Kalshi instead of `kalshi-sim` (requires Kalshi account with KYC), only the env vars change — set `KALSHI_API_BASE` and `KALSHI_WS_URL` to Kalshi's URLs, point `KALSHI_KEY_PATH` at the key uploaded to Kalshi's dashboard. The C++ code is identical.
+
+**Maintenance window note** (production only): real Kalshi pauses trading every Thursday 3:00-5:00 AM ET. WebSocket connections drop; orders with `cancel_order_on_pause=true` are auto-cancelled. `kalshi-sim`'s `POST /sim/drop_connection` simulates this so we can validate our reconnection FSM without waiting until Thursday.
 
 ## Measured Results
 
@@ -354,10 +479,13 @@ Pool benchmarks use a 64-byte `Order` struct (one cache line). The pool never to
 
 ## Target Resume Bullet
 
-> **kalshi-cpp** | *Low-latency C++ prediction market trading client* [GitHub]
-> - Built a C++ trading client connecting to Kalshi WebSocket and REST APIs with lock-free SPSC queues, custom arena/pool allocators, and OS-level tuning (CPU pinning, huge pages, mlockall); zero heap allocation on hot path, p99 tick-to-order latency under X us.
-> - Custom SPSC queue: 1 ns single-thread push/pop, 44 M items/sec cross-thread throughput — 5× faster than mutex-protected `std::queue` under concurrent load.
+> **kalshi-cpp** | *Low-latency C++ prediction-market trading client + conformant exchange simulator* [GitHub]
+> - Built a complete low-latency trading stack in C++20: `kalshi-cpp`, a client implementing Kalshi's REST + WebSocket protocol with RSA-PSS request signing, and `kalshi-sim`, a **conformant exchange simulator** speaking the same protocol — used for reproducible end-to-end benchmarks and adversarial-scenario testing (forced disconnects, sequence-number gaps, partial fills, throttle storms).
+> - Lock-free SPSC queues, custom arena/pool/hash-map allocators, custom open-addressing Robin Hood hash table; zero heap allocations on the hot path. End-to-end p99 tick-to-trade latency under X µs measured against `kalshi-sim` with `tc netem`-injected 100 µs RTT (representative of colocated LAN).
+> - Custom SPSC queue: 1 ns single-thread push/pop, 44 M items/sec cross-thread throughput — 30× faster than mutex-protected `std::queue` (single-thread, no contention).
 > - Custom pool allocator: 1.8 ns per order alloc/dealloc cycle — 4× faster than `malloc`, 8× faster than `std::list`, fully deterministic.
+> - Custom Robin Hood `FlatHashMap` (open addressing, backshift deletion, mmap-backed): 2× faster insert/erase and 1.2× faster steady-state churn vs `std::unordered_map`; find within 50% of std with strictly bounded tail latency (no rehash, no per-op allocation) — architecture aligned with Optiver/Jane Street public guidance for HFT containers.
+> - Network-stack optimization with measured per-knob impact: `TCP_NODELAY`, `SO_BUSY_POLL`, `TCP_QUICKACK`, `io_uring` backend, CPU pinning, huge pages, `mlockall`. Production deployment path to kernel-bypass NIC (Solarflare ef_vi / DPDK) documented with expected latency gains.
 
 ## Kalshi API Quick Reference
 
