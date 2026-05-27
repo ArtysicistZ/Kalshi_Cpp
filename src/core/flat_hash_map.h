@@ -58,15 +58,25 @@ public:
     template<typename V>
         requires std::assignable_from<Value&, V>
     bool insert(Key key, V&& value) {
+        Key k = key;
+        Value v = std::forward<V>(value);
         size_t pos = hash_(key) & mask_;
         size_t ctr = 0;
-        while (slots_[pos].key != EMPTY && slots_[pos].key != key) {
+        size_t dist = 0;
+        while (slots_[pos].key != EMPTY && slots_[pos].key != k) {
             if (++ctr == Capacity) return false;
+            size_t resident_dist = probe_distance_(slots_[pos].key, pos);
+            if (resident_dist < dist) {
+                std::swap(k, slots_[pos].key);
+                std::swap(v, slots_[pos].value);
+                dist = resident_dist;
+            }
             pos = (pos + 1) & mask_;
+            dist++;
         }
         bool inserting_new = (slots_[pos].key == EMPTY);
-        slots_[pos].key = key;
-        slots_[pos].value = std::forward<V>(value);
+        slots_[pos].key = std::move(k);
+        slots_[pos].value = std::move(v);
         if (inserting_new) size_++;
         return true;
     }
@@ -110,7 +120,7 @@ public:
 
 private:
     static size_t hash_(Key key) {
-        x = static_cast<size_t>(key);
+        size_t x = static_cast<size_t>(key);
         x ^= x >> 30;
         x *= 0xbf58476d1ce4e5b9ULL;
         x ^= x >> 27;

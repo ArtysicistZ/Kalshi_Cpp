@@ -74,15 +74,10 @@ target_include_directories(test_pool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_pool PRIVATE GTest::gtest_main)
 add_test(NAME test_pool COMMAND test_pool)
 
-# add_executable(test_book test/test_book.cpp)
-# target_include_directories(test_book PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# target_link_libraries(test_book PRIVATE GTest::gtest_main)
-# add_test(NAME test_book COMMAND test_book)
-
-# add_executable(test_auth test/test_auth.cpp)
-# target_include_directories(test_auth PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# target_link_libraries(test_auth PRIVATE GTest::gtest_main OpenSSL::SSL OpenSSL::Crypto)
-# add_test(NAME test_auth COMMAND test_auth)
+add_executable(test_flat_hash_map test/test_flat_hash_map.cpp)
+target_include_directories(test_flat_hash_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_flat_hash_map PRIVATE GTest::gtest_main)
+add_test(NAME test_flat_hash_map COMMAND test_flat_hash_map)
 
 # ── Benchmarks ──
 add_executable(bench_spsc bench/bench_spsc.cpp)
@@ -93,10 +88,6 @@ add_executable(bench_pool bench/bench_pool.cpp)
 target_include_directories(bench_pool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_pool PRIVATE benchmark::benchmark_main)
 
-# add_executable(bench_allocator bench/bench_allocator.cpp)
-# target_include_directories(bench_allocator PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# target_link_libraries(bench_allocator PRIVATE benchmark::benchmark_main)
-
-# add_executable(bench_parser bench/bench_parser.cpp)
-# target_include_directories(bench_parser PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# target_link_libraries(bench_parser PRIVATE benchmark::benchmark_main simdjson::simdjson)
+add_executable(bench_flat_hash_map bench/bench_flat_hash_map.cpp)
+target_include_directories(bench_flat_hash_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_flat_hash_map PRIVATE benchmark::benchmark_main)
