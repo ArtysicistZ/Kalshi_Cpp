@@ -12,11 +12,11 @@ class SPSCQueue {
 
     static_assert(
         (Capacity & (Capacity - 1)) == 0,
-        "Capacity must be power of 2!"
+        "fatal: Capacity must be power of 2!"
     );
     static_assert(
         Capacity > 0,
-        "Capacity must be positive!"
+        "fatal: Capacity must be positive!"
     );
 
     alignas(64) std::atomic<size_t> head_{0};

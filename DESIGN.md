@@ -84,6 +84,7 @@ kalshi-cpp/
 │   │   ├── spsc_queue.h          # Lock-free SPSC ring buffer
 │   │   ├── arena_alloc.h         # Arena (bump) allocator
 │   │   ├── pool_alloc.h          # Fixed-size pool allocator
+│   │   ├── flat_hash_map.h       # Open-addressing fixed-capacity hash map
 │   │   └── clock.h               # rdtsc + calibration
 │   ├── strategy/             # Trading logic
 │   │   ├── signal.h/cpp          # Signal generation
@@ -147,14 +148,21 @@ kalshi-cpp/
 - **Arena allocator**: bump pointer, bulk reset per tick. Used for JSON parse buffers.
   - `allocate(size, align)`: bump offset, return pointer. O(1).
   - `reset()`: set offset to 0. O(1).
-  - Backed by `mmap(MAP_HUGETLB)` for 2MB huge pages (Linux).
+  - Backed by `mmap` (Linux). `MAP_HUGETLB` deferred to Phase 4 (requires `vm.nr_hugepages` sysctl).
   - Must allocate `SIMDJSON_PADDING` (64 bytes) extra past the end of each input buffer — simdjson reads past the input using SIMD and requires this padding to avoid segfaults.
+  - **No pmr inheritance**: parser calls `arena.allocate()` directly; simdjson uses its own allocator. Skipping pmr keeps the arena lean (~40 lines, no vtable).
 - **Pool allocator**: fixed-size blocks for Order objects.
   - Intrusive free-list through the blocks themselves (no separate node allocation).
   - O(1) allocate (pop), O(1) deallocate (push).
-- **`std::pmr` integration**: use `std::pmr::polymorphic_allocator` so STL containers use our allocators.
+  - Inherits from `std::pmr::memory_resource` so it can plug into any STL container that wants pool-backed allocations.
+- **Flat hash map**: open-addressing, fixed-capacity, linear probing with backshift deletion. Replaces `std::pmr::unordered_map` for order lookups.
+  - Template `FlatHashMap<Key, Value, Capacity>` where `Capacity` is a power of two.
+  - Default sizing for Kalshi: `Capacity = 524288` (2^19) — supports the full 200K open-order API limit at ~39% load factor, fits in 8 MB.
+  - Sentinel key (e.g., `UINT64_MAX`) marks empty slots — no separate state array.
+  - Lookup: hash key → probe forward until match or empty slot. Expected p50 ~15ns, p99 ~50ns at 200K entries (vs `std::unordered_map` p50 ~80ns, p99 ~500ns).
+  - Never grows: insertion fails when ≥ 70% loaded. Predictable failure beats unpredictable rehash spikes (50ms+).
 - **Verification**: override global `operator new`/`operator delete` in debug builds. Set a thread-local `bool hot_path_active` flag; when true, any call to `operator new` triggers `assert(false)` with a backtrace. This catches hidden allocations from STL containers, simdjson internals, Boost, or accidental `std::string` construction.
-- Target: benchmark against `malloc` showing deterministic latency (no jitter from syscalls)
+- Target: benchmark allocators against `malloc`/`new` showing deterministic latency (no jitter from syscalls). Benchmark `FlatHashMap` vs `std::unordered_map` at 200K entries.
 
 **2.3 Internal message types**
 - Flat POD structs for market data messages (no `std::string`, no heap)
@@ -175,7 +183,9 @@ kalshi-cpp/
 **3.2 Order manager**
 - Order lifecycle: New -> Pending -> Acked -> Filled/Cancelled
 - Pool-allocated Order objects
-- Order ID -> Order* lookup via `std::pmr::unordered_map`
+- Order ID -> Order* lookup via custom `FlatHashMap` (open-addressing, ~15ns p50 vs ~80ns for `std::unordered_map`)
+  - Sized at 524,288 slots (covers Kalshi's 200K open-order API cap with headroom; 8 MB footprint)
+  - Capacity is a template parameter — bump for higher-volume venues (options MM workloads can need 1M+)
 - Pre-flight risk checks (position limit, max order size, max notional)
 
 **3.3 Rate limiter**
@@ -226,6 +236,7 @@ kalshi-cpp/
 - SPSC queue: ops/sec, RTT latency at various batch sizes
 - Arena allocator vs `malloc`: allocation latency histogram
 - Pool allocator vs `new`: allocation + deallocation cycle
+- `FlatHashMap` vs `std::unordered_map`: lookup/insert/delete at 1K, 10K, 100K, 200K entries
 - simdjson vs nlohmann/json: parse latency per message
 - Order book update: nanoseconds per `orderbook_delta` apply
 
