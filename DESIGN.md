@@ -321,10 +321,43 @@ Demo and production are fully isolated — keys and accounts do not cross enviro
 
 **Maintenance window**: Kalshi pauses trading every Thursday 3:00-5:00 AM ET. WebSocket connections may drop. Orders with `cancel_order_on_pause=true` are auto-cancelled.
 
+## Measured Results
+
+Microbenchmarks via Google Benchmark on x86-64 (22-core, 3072 MHz, 24 MB L3). Release build (`-O3 -march=native -flto`). Numbers are mean per-operation latency unless noted.
+
+### SPSC Queue
+
+| Benchmark | Time | vs alternative |
+|---|---|---|
+| `BM_PushPop` (single-thread, int) | **1.01 ns** | `std::queue` (no thread safety): 1.18 ns |
+| `BM_PushPopFat` (single-thread, 108-byte struct) | 8.05 ns | dominated by memcpy of payload |
+| `BM_StdQueueMutex_PushPop` (single-thread, no contention) | 30.5 ns | **30× slower than our SPSC** |
+| `BM_CrossThread_Throughput` (two threads) | **44 M items/sec** | mutex-protected `std::queue`: 8.9 M items/sec (**5× slower**) |
+| `BM_CrossThread_RTT` (ping-pong, two threads) | 348 ns/round-trip | no CPU pinning yet — expected to drop in Phase 4 |
+
+### Pool Allocator
+
+| Benchmark | Time | vs alternative |
+|---|---|---|
+| `BM_Pool_RealisticUsage` (alloc + field writes + dealloc) | **0.76 ns** | `malloc`/`free`: 8.97 ns (**12× slower**) |
+| `BM_Pool_Churning` (1024-order steady-state turnover) | **1.80 ns** | `malloc`/`free`: 7.72 ns (**4× slower**); `std::list` push/pop: 14.9 ns (**8× slower**) |
+| `BM_Pool_FillDrain` (sustained throughput) | **776 M ops/sec** | `malloc`/`free`: 163 M ops/sec (**4.8× slower**) |
+| `BM_Pool_AllocDealloc` (raw allocate+deallocate) | 0.26 ns | malloc: 7.24 ns; new/delete: 8.55 ns (`Pool_Churning` is the more honest realistic number) |
+
+Pool benchmarks use a 64-byte `Order` struct (one cache line). The pool never touches `malloc` after construction.
+
+### Caveats
+
+- Cross-thread RTT (348 ns) is higher than rigtorp's 133 ns Linux-pinned baseline because we don't yet have CPU pinning, `SCHED_FIFO`, or core isolation. Phase 4 (OS-level tuning) should close this gap.
+- Single-op `BM_Pool_AllocDealloc` (0.26 ns) likely reflects compiler optimization of the unused result; the churning number is what to cite externally.
+- Google Benchmark's "DEBUG" warning on MinGW/MSYS2 is spurious — Release flags are confirmed applied via `compile_commands.json`.
+
 ## Target Resume Bullet
 
 > **kalshi-cpp** | *Low-latency C++ prediction market trading client* [GitHub]
 > - Built a C++ trading client connecting to Kalshi WebSocket and REST APIs with lock-free SPSC queues, custom arena/pool allocators, and OS-level tuning (CPU pinning, huge pages, mlockall); zero heap allocation on hot path, p99 tick-to-order latency under X us.
+> - Custom SPSC queue: 1 ns single-thread push/pop, 44 M items/sec cross-thread throughput — 5× faster than mutex-protected `std::queue` under concurrent load.
+> - Custom pool allocator: 1.8 ns per order alloc/dealloc cycle — 4× faster than `malloc`, 8× faster than `std::list`, fully deterministic.
 
 ## Kalshi API Quick Reference
 
