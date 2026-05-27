@@ -31,13 +31,13 @@ FetchContent_Declare(googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG v1.15.2
 )
-# FetchContent_Declare(googlebenchmark
-#     GIT_REPOSITORY https://github.com/google/benchmark.git
-#     GIT_TAG v1.9.1
-# )
+FetchContent_Declare(googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.5
+)
 
-# set(BENCHMARK_ENABLE_TESTING OFF)
-FetchContent_MakeAvailable(googletest)
+set(BENCHMARK_ENABLE_TESTING OFF)
+FetchContent_MakeAvailable(googletest googlebenchmark)
 
 # ── Main executable (uncomment as files are implemented) ──
 # add_executable(kalshi-cpp
@@ -80,9 +80,9 @@ add_test(NAME test_spsc COMMAND test_spsc)
 # add_test(NAME test_auth COMMAND test_auth)
 
 # ── Benchmarks ──
-# add_executable(bench_spsc bench/bench_spsc.cpp)
-# target_include_directories(bench_spsc PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# target_link_libraries(bench_spsc PRIVATE benchmark::benchmark_main)
+add_executable(bench_spsc bench/bench_spsc.cpp)
+target_include_directories(bench_spsc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_spsc PRIVATE benchmark::benchmark_main)
 
 # add_executable(bench_allocator bench/bench_allocator.cpp)
 # target_include_directories(bench_allocator PRIVATE ${CMAKE_SOURCE_DIR}/src)
