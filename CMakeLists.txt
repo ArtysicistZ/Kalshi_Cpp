@@ -79,6 +79,12 @@ target_include_directories(test_flat_hash_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_flat_hash_map PRIVATE GTest::gtest_main)
 add_test(NAME test_flat_hash_map COMMAND test_flat_hash_map)
 
+add_executable(test_rest_client
+    test/test_rest_client.cpp
+    src/net/rest_client.cpp
+)
+target_include_directories(test_rest_client PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # ── Benchmarks ──
 add_executable(bench_spsc bench/bench_spsc.cpp)
 target_include_directories(bench_spsc PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -91,3 +97,13 @@ target_link_libraries(bench_pool PRIVATE benchmark::benchmark_main)
 add_executable(bench_flat_hash_map bench/bench_flat_hash_map.cpp)
 target_include_directories(bench_flat_hash_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_flat_hash_map PRIVATE benchmark::benchmark_main)
+
+# ── Exchange simulator (kalshi-sim) ──
+add_executable(kalshi-sim
+    sim/main.cpp
+    sim/rest_server.cpp
+)
+target_include_directories(kalshi-sim PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+)

@@ -56,7 +56,7 @@ private:
     bool bind_and_listen_();
     void on_accept_();
     void on_readable_(int fd);
-    bool write_response_(int fd, kalshi::sim::Response& response);
+    bool write_response_(int fd, const kalshi::sim::Response& response);
     void close_connection_(int fd);
 
     Response dispatch_(const Request& req);

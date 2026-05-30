@@ -225,6 +225,7 @@ void RestServer::on_readable_(int fd) {
             write_response_(fd, response);
             connections_[fd].in_buffer.clear();
             close_connection_(fd);
+            break;
 
         } else {
             if (n < 0) {
@@ -240,7 +241,7 @@ void RestServer::on_readable_(int fd) {
 
 }
 
-bool RestServer::write_response_(int fd, kalshi::sim::Response& response) {
+bool RestServer::write_response_(int fd, const kalshi::sim::Response& response) {
 
     std::string resp = serialize_response(response);
     ssize_t to_send = resp.length();
