@@ -18,6 +18,11 @@ int main() {
         perror("socket");
         return 1;
     }
+    if (fcntl(listen_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(listen_fd);
+        return 1;
+    }
 
     int yes = 1;
     if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
@@ -28,8 +33,8 @@ int main() {
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = (uint16_t)htons(9000);
-    addr.sin_addr.s_addr = (uint32_t)htonl(INADDR_ANY);
+    addr.sin_port = htons(9000);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -43,7 +48,7 @@ int main() {
     }
     int epfd = epoll_create1(0);
     if (epfd < 0) {
-        perror("epoll_create");
+        perror("epoll_create1");
         close(listen_fd);
         return 1;
     }
