@@ -57,6 +57,8 @@ private:
     uint64_t next_order_id_ = 1;
 
 public:
+    MatchingEngine() = default;
+    ~MatchingEngine() = default;
 
     MatchingEngine(const MatchingEngine&) = delete;
     MatchingEngine& operator=(const MatchingEngine&) = delete;
