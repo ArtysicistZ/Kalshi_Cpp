@@ -1,4 +1,4 @@
-#include "sim/rest_server.h"
+#include "sim/http/rest_server.h"
 
 #include <cstdio>
 

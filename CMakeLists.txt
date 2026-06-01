@@ -100,7 +100,7 @@ target_link_libraries(bench_flat_hash_map PRIVATE benchmark::benchmark_main)
 
 add_executable(test_matching_engine
     test/test_matching_engine.cpp
-    sim/matching_engine.cpp
+    sim/domain/matching_engine.cpp
 )
 target_include_directories(test_matching_engine PRIVATE
     ${CMAKE_SOURCE_DIR}
@@ -112,7 +112,7 @@ add_test(NAME test_matching_engine COMMAND test_matching_engine)
 # ── Exchange simulator (kalshi-sim) ──
 add_executable(kalshi-sim
     sim/main.cpp
-    sim/rest_server.cpp
+    sim/http/rest_server.cpp
 )
 target_include_directories(kalshi-sim PRIVATE
     ${CMAKE_SOURCE_DIR}

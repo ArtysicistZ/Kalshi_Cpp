@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstdint>
 
-#include "sim/matching_engine.h"
+#include "sim/domain/matching_engine.h"
 
 using kalshi::sim::MatchingEngine;
 using kalshi::sim::Side;
