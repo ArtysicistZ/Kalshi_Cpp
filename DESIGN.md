@@ -73,6 +73,48 @@ The codebase uses POSIX/Linux APIs for OS-level tuning (Phase 4). These have Win
 
 **WSL2 notes**: WSL2 runs a real Linux 5.15+ kernel, so `epoll`, `sched_setaffinity`, `mmap(MAP_HUGETLB)`, and `mlockall` all work. `io_uring` support depends on the WSL kernel version (available in 5.15+ but may require kernel update). `SCHED_FIFO` requires `CAP_SYS_NICE` (run with `sudo` or adjust `/etc/security/limits.conf`). Huge pages require `vm.nr_hugepages` sysctl configuration.
 
+## Implementation Progress
+
+Snapshot of what's actually built vs. designed. Updated as commits land.
+
+| Area | Status | Notes |
+|---|---|---|
+| `src/core/spsc_queue` | DONE | 1.01 ns push/pop, 44 M items/sec cross-thread |
+| `src/core/pool_alloc` | DONE | 1.8 ns realistic alloc/dealloc, 776 M ops/sec fill/drain |
+| `src/core/arena_alloc` | DONE | bench pending |
+| `src/core/flat_hash_map` | DONE | Robin Hood, 524 288 capacity default |
+| `src/core/clock` | DONE | rdtsc + calibration |
+| `src/core/json_io` | scaffolded | shared JSON helpers; simdjson integration pending CMake hookup |
+| `src/net/auth` | scaffolded | RSA-PSS signing API in place |
+| `src/net/rest_client` | scaffolded | round-trip test exists (`test_rest_client.cpp`) |
+| `src/net/ws_client` + `ws_reconnect` | scaffolded | reconnection FSM design only |
+| `src/net/rate_limiter` | scaffolded | header only, no impl yet |
+| `src/feed/parser`, `src/feed/book` | scaffolded | |
+| `src/strategy/*`, `src/system/tuning` | scaffolded | |
+| `sim/domain/matching_engine` | DONE | price-time priority CLOB, covered by `test_matching_engine.cpp` |
+| `sim/domain/market_registry` | in progress | Block 1 |
+| `sim/domain/account_book` | in progress | Block 2 |
+| `sim/domain/types.h` | empty | to populate with Side / OrderId / ClientId / Price / Qty / Ticker / Fill |
+| `sim/services/exchange_service` | in progress | Block 2 |
+| `sim/http/rest_server` | DONE | custom epoll HTTP/1.1, no TLS |
+| `sim/http/handlers` | in progress | Block 1 — order/orderbook/cancel endpoints |
+| `sim/http/auth_middleware` | in progress | Block 3 |
+| `sim/auth/auth_verify` | scaffolded | Block 3 |
+| `sim/ws/*` | scaffolded | Block 4 |
+| `sim/scenario/*` | scaffolded | Block 5 |
+| `simdjson` in `CMakeLists.txt` | not yet | `FetchContent_Declare` is commented out; uncomment when `json_io` needs it |
+| `docs/PRODUCTION_TUNING.md`, `docs/BENCHMARK_RESULTS.md` | not yet created | |
+
+**Implementation block sequence (parallel to Phase numbering, but pedagogy-driven):**
+
+- **Block 1** — wire matching engine into REST server (populate `types.h`, finish `market_registry`, write `http/handlers` for POST order / GET orderbook / DELETE order). Builds JSON parsing, schema-validation, and composition-root concepts.
+- **Block 2** — `account_book` + `exchange_service`: introduce the service layer and exchange-wide invariants (balance ≥ 0, position bookkeeping, fill fan-out).
+- **Block 3** — `http/auth_middleware` + `auth/auth_verify`: RSA-PSS verification end-to-end, KALSHI-ACCESS-* header semantics.
+- **Block 4** — `ws/`: WebSocket handshake (reusing `auth/`), subscription state, snapshot + delta fan-out from `exchange_service`.
+- **Block 5** — `scenario/`: control endpoint for delay/drops/partial fills/seq gaps; exercise the client's recovery paths.
+- **Block 6** — TCP / Wireshark deep dive against the running sim (kernel-level investigation, not new features).
+- **Block 7** — MPSC refactor where the matching engine becomes a single-consumer with multiple producing transports.
+
 ## Scope
 
 ### Phase 1: Foundation (Week 1-2)
@@ -94,12 +136,13 @@ kalshi-cpp/
 │   ├── feed/                       # Market data processing
 │   │   ├── parser.h/cpp                # JSON -> internal structs (simdjson)
 │   │   └── book.h/cpp                  # Order book reconstruction
-│   ├── core/                       # Low-latency primitives (DONE)
-│   │   ├── spsc_queue.h                # Lock-free SPSC ring buffer
-│   │   ├── arena_alloc.h               # Arena (bump) allocator
-│   │   ├── pool_alloc.h                # Fixed-size pool allocator
-│   │   ├── flat_hash_map.h             # Robin Hood open-addressing hash map
-│   │   └── clock.h                     # rdtsc + calibration
+│   ├── core/                       # Low-latency primitives + shared utilities
+│   │   ├── spsc_queue.h                # Lock-free SPSC ring buffer [DONE]
+│   │   ├── arena_alloc.h               # Arena (bump) allocator [DONE]
+│   │   ├── pool_alloc.h                # Fixed-size pool allocator [DONE]
+│   │   ├── flat_hash_map.h             # Robin Hood open-addressing hash map [DONE]
+│   │   ├── clock.h                     # rdtsc + calibration [DONE]
+│   │   └── json_io.h/cpp               # Project-wide JSON helpers (used by client + sim)
 │   ├── strategy/                   # Trading logic
 │   │   ├── signal.h/cpp                # Signal generation
 │   │   └── order_manager.h/cpp         # Order lifecycle
@@ -109,30 +152,44 @@ kalshi-cpp/
 │       ├── log.h                       # Lock-free logging
 │       └── histogram.h                 # Latency percentile tracking (HDR)
 ├── sim/                            # Exchange simulator `kalshi-sim` (Phase 5)
-│   ├── main.cpp                        # Server entrypoint, arg parsing
-│   ├── rest_server.h/cpp               # HTTPS server (Beast); endpoint dispatch
-│   ├── ws_server.h/cpp                 # WS feed (replay + generative modes)
-│   ├── auth_verify.h/cpp               # EVP_DigestVerify against registered pubkeys
-│   ├── matching_engine.h/cpp           # CLOB, price-time priority
-│   ├── scenario.h/cpp                  # /sim/* control endpoint (inject delay etc.)
+│   ├── main.cpp                        # Server entrypoint, composition root (wires deps)
+│   ├── domain/                         # Pure business logic — no I/O, no protocol, no JSON
+│   │   ├── types.h                         # Side, OrderId, ClientId, Price, Qty, Ticker, Fill
+│   │   ├── matching_engine.h/cpp           # CLOB, price-time priority [DONE]
+│   │   ├── market_registry.h/cpp           # Owns per-ticker MatchingEngine instances (unique_ptr for pointer stability)
+│   │   └── account_book.h/cpp              # Per-client balance + position bookkeeping
+│   ├── services/                       # Orchestration — composes domain calls, threads cross-cutting rules
+│   │   └── exchange_service.h/cpp          # POST order → engine.match → account.apply → fan-out fills
+│   ├── http/                           # HTTP transport adapter
+│   │   ├── rest_server.h/cpp               # Custom epoll-based HTTP/1.1 server (raw sockets, no Beast, no TLS yet) [DONE]
+│   │   ├── handlers.h/cpp                  # Request → ExchangeService call → Response (JSON serialization lives here)
+│   │   └── auth_middleware.h/cpp           # HTTP adapter for auth/: parses KALSHI-* headers, calls auth_verify, threads ClientId into Request
+│   ├── ws/                             # WebSocket transport adapter (Phase 5.2)
+│   │   ├── ws_server.h/cpp                 # WS feed (replay + generative modes)
+│   │   └── ws_handlers.h/cpp               # subscribe / unsubscribe / snapshot dispatch
+│   ├── auth/                           # Protocol-agnostic crypto — reused by http/ and ws/
+│   │   └── auth_verify.h/cpp               # EVP_DigestVerify against registered pubkeys
+│   ├── scenario/                       # Adversarial-scenario control endpoint
+│   │   └── scenario.h/cpp                  # /sim/* knobs (delay, drops, partial fills, seq gaps, throttle)
 │   └── replay/                         # Captured Kalshi payload samples
 │       └── *.json
 ├── bench/                          # Micro-benchmarks
 │   ├── bench_spsc.cpp                  # DONE
 │   ├── bench_pool.cpp                  # DONE
 │   ├── bench_flat_hash_map.cpp         # DONE
-│   ├── bench_arena.cpp
-│   ├── bench_parser.cpp                # simdjson vs nlohmann
-│   ├── bench_book.cpp                  # orderbook_delta apply latency
-│   └── bench_e2e.cpp                   # tick-to-trade against kalshi-sim under tc netem
+│   ├── bench_arena.cpp                 # (planned)
+│   ├── bench_parser.cpp                # simdjson vs nlohmann (planned)
+│   ├── bench_book.cpp                  # orderbook_delta apply latency (planned)
+│   └── bench_e2e.cpp                   # tick-to-trade against kalshi-sim under tc netem (planned)
 ├── test/                           # Unit tests
 │   ├── test_spsc.cpp                   # DONE
 │   ├── test_pool.cpp                   # DONE
 │   ├── test_flat_hash_map.cpp          # DONE
-│   ├── test_auth.cpp                   # Self-test + Kalshi reference vector
-│   ├── test_book.cpp
-│   ├── test_parser.cpp
-│   └── test_matching.cpp               # kalshi-sim CLOB correctness
+│   ├── test_rest_client.cpp            # DONE — REST client round-trip
+│   ├── test_matching_engine.cpp        # DONE — kalshi-sim CLOB correctness
+│   ├── test_auth.cpp                   # Self-test + Kalshi reference vector (planned, Phase 1.2)
+│   ├── test_book.cpp                   # (planned, Phase 3.1)
+│   └── test_parser.cpp                 # (planned, Phase 1.3)
 ├── scripts/
 │   ├── isolate_cpus.sh                 # CPU isolation helper
 │   ├── netem_colocated.sh              # tc netem: ~5 us RTT
@@ -306,13 +363,36 @@ These are described in `docs/PRODUCTION_TUNING.md` with the specific API/sockopt
 
 A conformant Kalshi-protocol server, written in C++ for both correctness and apples-to-apples measurement. The simulator lets the client be benchmarked end-to-end without giving SSN to a regulated exchange, and unlocks adversarial-scenario testing that no real exchange would permit.
 
+**Architectural layering (sim/)**
+
+The simulator is intentionally split into a strict DAG of layers so that adding WS (Phase 5.2), TLS, or alternative transports doesn't ripple through unrelated code:
+
+```
+domain/   ← pure business logic; depends on nothing else in sim/
+  ↑
+services/ ← orchestrates domain objects; threads cross-cutting policies (auth identity, fan-out)
+  ↑
+http/  ws/  scenario/   ← transport adapters; turn bytes into a service call and back
+  ↑
+auth/  ← protocol-agnostic crypto; called from http/auth_middleware and ws/ handshake
+```
+
+- `domain/` contains the matching engine, market registry, account book, and the shared `types.h`. No JSON, no sockets, no Boost. Tested in isolation by `test_matching_engine.cpp`.
+- `services/exchange_service` is the *only* place where an order-placement call composes engine matching with account bookkeeping and downstream notification — preventing transports from acquiring direct write access to domain objects.
+- `http/` is a transport adapter: `rest_server` knows about sockets and HTTP/1.1; `handlers` knows about JSON and the service API; `auth_middleware` is the HTTP-side adapter for `auth/` (parses headers, calls `auth_verify`, stamps `Request.authenticated_client_id`).
+- `auth/auth_verify` is deliberately protocol-agnostic so the WS handshake (Phase 5.2) can reuse it without depending on HTTP types.
+- `main.cpp` is the composition root: it constructs the registries, the service, wires middleware around the server, and registers routes. No other file knows the full object graph.
+
 **5.1 REST server**
-- Boost.Beast HTTPS server on `127.0.0.1:8443` (self-signed cert for TLS).
-- Verifies the three `KALSHI-ACCESS-*` headers on every request:
+- Custom **epoll-based HTTP/1.1 server** on `127.0.0.1:8443` — raw `socket`/`bind`/`listen`/`accept` plus `epoll_wait`. No Boost.Beast, no TLS in the current cut. This is a deliberate teaching choice: walking the kernel-level path (file descriptors, `epoll_ctl`, partial reads, per-connection buffers, write-readiness) is part of the Phase-5 systems-deep-dive value of the simulator.
+- `RestServer` exposes a tiny core: `Request { method, path, headers, body, optional<ClientId> authenticated_client_id }`, `Response { status, content_type, body }`, and `using Handler = std::function<Response(const Request&)>`. Exact-match routing keyed by `method + " " + path`.
+- TLS deferred — the design parity argument (matching Kalshi's wire surface byte-for-byte) is preserved through `auth/` and the handler set; adding TLS is purely a `rest_server` upgrade later (either by switching to Beast + OpenSSL or by adding a manual `SSL_*` wrap around the socket).
+- `http/auth_middleware` verifies the three `KALSHI-ACCESS-*` headers on every request:
   - Parses `KALSHI-ACCESS-KEY` UUID against the registered set.
-  - Reconstructs the signing message `{timestamp}{method}{path}` and verifies `KALSHI-ACCESS-SIGNATURE` against the client's registered public key via `EVP_DigestVerify*`.
+  - Reconstructs the signing message `{timestamp}{method}{path}` and verifies `KALSHI-ACCESS-SIGNATURE` against the client's registered public key via `EVP_DigestVerify*` (delegated to `auth/auth_verify`).
   - Rejects with 401 on signature mismatch, ±5 s timestamp skew, or unknown key.
-- Implements endpoints: `GET /exchange/status`, `GET /portfolio/balance`, `POST /portfolio/orders`, `DELETE /portfolio/orders/{id}`.
+  - On success, stamps `Request.authenticated_client_id` so downstream handlers don't re-parse headers.
+- Endpoints (implemented in `http/handlers`): `GET /exchange/status`, `GET /portfolio/balance`, `POST /portfolio/orders`, `DELETE /portfolio/orders/{id}`, and orderbook reads.
 
 **5.2 WebSocket feed**
 - Boost.Beast WebSocket server on `127.0.0.1:8444`.
