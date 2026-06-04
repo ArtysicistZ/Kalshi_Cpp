@@ -23,10 +23,10 @@ find_package(OpenSSL REQUIRED)
 # ── Fetch third-party libraries ──
 include(FetchContent)
 
-# FetchContent_Declare(simdjson
-#     GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-#     GIT_TAG v3.12.2
-# )
+FetchContent_Declare(simdjson
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG v3.12.2
+)
 FetchContent_Declare(googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG v1.15.2
@@ -37,7 +37,8 @@ FetchContent_Declare(googlebenchmark
 )
 
 set(BENCHMARK_ENABLE_TESTING OFF)
-FetchContent_MakeAvailable(googletest googlebenchmark)
+set(SIMDJSON_DEVELOPER_MODE OFF)
+FetchContent_MakeAvailable(googletest googlebenchmark simdjson)
 
 # ── Main executable (uncomment as files are implemented) ──
 # add_executable(kalshi-cpp
@@ -113,8 +114,20 @@ add_test(NAME test_matching_engine COMMAND test_matching_engine)
 add_executable(kalshi-sim
     sim/main.cpp
     sim/http/rest_server.cpp
+    sim/http/handlers.cpp
+    sim/domain/matching_engine.cpp
+    sim/domain/market_registry.cpp
 )
 target_include_directories(kalshi-sim PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(kalshi-sim PRIVATE simdjson::simdjson)
+
+# ── Mirror compile_commands.json to project root so editors (clangd, IntelliSense) auto-discover it ──
+add_custom_target(copy_compile_commands ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_BINARY_DIR}/compile_commands.json
+        ${CMAKE_SOURCE_DIR}/compile_commands.json
+    COMMENT "Mirroring compile_commands.json to project root"
 )
