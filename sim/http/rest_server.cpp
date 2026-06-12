@@ -14,7 +14,7 @@ namespace {
 std::optional<kalshi::sim::Request> parse_request(const std::string& buffer) {
 
     kalshi::sim::Request request;
-    
+
     size_t ptr = buffer.find("\r\n\r\n");
     if (ptr == std::string::npos) return std::nullopt;
     ptr += 4;
@@ -87,9 +87,8 @@ std::string serialize_response(const kalshi::sim::Response& resp) {
 
 namespace kalshi::sim {
 
-RestServer::RestServer(uint16_t port) : port_(port) {}
+RestServer::RestServer(Reactor& reactor, uint16_t port) : reactor_(reactor), port_(port) {}
 RestServer::~RestServer() {
-    if (epfd_ != -1) close(epfd_);
     if (listen_fd_ != -1) close(listen_fd_);
     for (auto& [fd, _] : connections_) close(fd);
 }
@@ -102,26 +101,11 @@ void RestServer::route(
     routes_[method + " " + path] = std::move(handler);
 }
 
-bool RestServer::run() {
+bool RestServer::start() {
 
     if (!bind_and_listen_()) return false;
-
-    while (true) {
-        struct epoll_event events[64];
-        int n = epoll_wait(epfd_, events, 64, -1);
-        if (n < 0) {
-            perror("epoll_wait");
-            continue;
-        }
-        for (int i = 0; i < n; i++) {
-            if (events[i].data.fd == listen_fd_) {
-                on_accept_();
-            } else {
-                on_readable_(events[i].data.fd);
-            }
-        }
-    }
-    return true;
+    return reactor_.add_fd(listen_fd_, EPOLLIN | EPOLLET,
+        [this](int fd, uint32_t events) { this->on_listener_event_(fd, events); });
 
 }
 
@@ -161,28 +145,11 @@ bool RestServer::bind_and_listen_() {
         return false;
     }
 
-    epfd_ = epoll_create1(0);
-    if (epfd_ < 0) {
-        perror("epoll_create1");
-        close(listen_fd_);
-        return false;
-    }
-
-    struct epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = listen_fd_;
-    if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
-        perror("epoll_ctl");
-        close(listen_fd_);
-        close(epfd_);
-        return false;
-    }
-
     return true;
 
 }
 
-void RestServer::on_accept_() {
+void RestServer::on_listener_event_(int fd, uint32_t events) {
 
     while (true) {
         int client_fd = accept(listen_fd_, nullptr, nullptr);
@@ -197,11 +164,8 @@ void RestServer::on_accept_() {
             continue;
         }
 
-        struct epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.fd = client_fd;
-        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-            perror("epoll_ctl");
+        if (!reactor_.add_fd(client_fd, EPOLLIN | EPOLLET,
+            [this](int f, uint32_t ev) { this->on_connection_event_(f, ev); })) {
             close(client_fd);
             continue;
         }
@@ -209,7 +173,7 @@ void RestServer::on_accept_() {
 
 }
 
-void RestServer::on_readable_(int fd) {
+void RestServer::on_connection_event_(int fd, uint32_t events) {
 
     char buf[4096];
     ssize_t n;
@@ -260,9 +224,7 @@ bool RestServer::write_response_(int fd, const kalshi::sim::Response& response) 
 }
 
 void RestServer::close_connection_(int fd) {
-    if (epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) < 0) {
-        perror("epoll_ctl");
-    }
+    reactor_.remove_fd(fd);
     close(fd);
     connections_.erase(fd);
 }

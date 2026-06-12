@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sim/reactor.h"
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -25,9 +27,9 @@ using Handler = std::function<Response(const Request&)>;
 
 class RestServer {
 private:
+    Reactor& reactor_;
     uint16_t port_;
     int listen_fd_ = -1;
-    int epfd_ = -1;
 
     struct Connection {
         std::string in_buffer;
@@ -38,7 +40,7 @@ private:
 
 
 public:
-    explicit RestServer(uint16_t port);
+    RestServer(Reactor& reactor, uint16_t port);
     ~RestServer();
 
     RestServer(const RestServer&) = delete;
@@ -50,12 +52,12 @@ public:
         Handler handler
     );
 
-    bool run();
+    bool start();
 
 private:
     bool bind_and_listen_();
-    void on_accept_();
-    void on_readable_(int fd);
+    void on_listener_event_(int fd, uint32_t events);
+    void on_connection_event_(int fd, uint32_t events);
     bool write_response_(int fd, const kalshi::sim::Response& response);
     void close_connection_(int fd);
 

@@ -113,6 +113,7 @@ add_test(NAME test_matching_engine COMMAND test_matching_engine)
 # ── Exchange simulator (kalshi-sim) ──
 add_executable(kalshi-sim
     sim/main.cpp
+    sim/reactor.cpp
     sim/http/rest_server.cpp
     sim/http/handlers.cpp
     sim/domain/matching_engine.cpp

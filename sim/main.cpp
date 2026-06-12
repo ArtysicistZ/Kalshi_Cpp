@@ -1,3 +1,4 @@
+#include "sim/reactor.h"
 #include "sim/http/rest_server.h"
 #include "sim/http/handlers.h"
 #include "sim/domain/market_registry.h"
@@ -7,10 +8,12 @@
 using namespace kalshi::sim;
 
 int main() {
-    RestServer server(8443);
+    Reactor reactor;
 
     MarketRegistry registry;
     registry.add_market("DEMO-1");
+
+    RestServer server(reactor, 8443);
 
     server.route("GET", "/exchange/status", [](const Request&) {
         return Response{200, "application/json", R"({"status": "ok"})"};
@@ -24,10 +27,12 @@ int main() {
         return handle_place_order(req, registry);
     });
 
-    if (!server.run()) {
-        fprintf(stderr, "server.run() failed\n");
+    if (!server.start()) {
+        fprintf(stderr, "server.start() failed\n");
         return 1;
     }
+
+    reactor.run();
     return 0;
 
 }
