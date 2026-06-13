@@ -1,6 +1,6 @@
 <div align="center">
 
-# kalshi-cpp
+# Kalshi Trading Engine
 
 **A low-latency C++20 trading stack for the Kalshi prediction market, with a conformant exchange simulator to benchmark against.**
 
