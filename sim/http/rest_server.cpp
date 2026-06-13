@@ -105,7 +105,9 @@ bool RestServer::start() {
 
     if (!bind_and_listen_()) return false;
     return reactor_.add_fd(listen_fd_, EPOLLIN | EPOLLET,
-        [this](int fd, uint32_t events) { this->on_listener_event_(fd, events); });
+        [this](int fd, uint32_t events) { 
+            this->on_listener_event_(fd, events); 
+        });
 
 }
 
