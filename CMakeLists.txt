@@ -110,6 +110,14 @@ target_include_directories(test_matching_engine PRIVATE
 target_link_libraries(test_matching_engine PRIVATE GTest::gtest_main)
 add_test(NAME test_matching_engine COMMAND test_matching_engine)
 
+add_executable(test_parser
+    test/test_parser.cpp
+    src/feed/parser.cpp
+)
+target_include_directories(test_parser PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_parser PRIVATE simdjson::simdjson GTest::gtest_main)
+add_test(NAME test_parser COMMAND test_parser)
+
 # ── Exchange simulator (kalshi-sim) ──
 add_executable(kalshi-sim
     sim/main.cpp
