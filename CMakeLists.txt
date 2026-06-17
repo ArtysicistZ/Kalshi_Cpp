@@ -99,6 +99,17 @@ add_executable(bench_flat_hash_map bench/bench_flat_hash_map.cpp)
 target_include_directories(bench_flat_hash_map PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_flat_hash_map PRIVATE benchmark::benchmark_main)
 
+add_executable(bench_hotpath
+    bench/bench_hotpath.cpp
+    src/feed/parser.cpp
+    src/feed/book.cpp
+    src/strategy/signal.cpp
+    src/strategy/order_manager.cpp
+    src/net/serialize.cpp
+)
+target_include_directories(bench_hotpath PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_hotpath PRIVATE simdjson::simdjson)
+
 add_executable(test_matching_engine
     test/test_matching_engine.cpp
     sim/domain/matching_engine.cpp
@@ -134,6 +145,23 @@ add_executable(test_signal
 target_include_directories(test_signal PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_signal PRIVATE simdjson::simdjson GTest::gtest_main)
 add_test(NAME test_signal COMMAND test_signal)
+
+add_executable(test_order_manager
+    test/test_order_manager.cpp
+    src/strategy/order_manager.cpp
+)
+target_include_directories(test_order_manager PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_order_manager PRIVATE simdjson::simdjson GTest::gtest_main)
+add_test(NAME test_order_manager COMMAND test_order_manager)
+
+add_executable(test_serialize
+    test/test_serialize.cpp
+    src/net/serialize.cpp
+    src/strategy/order_manager.cpp
+)
+target_include_directories(test_serialize PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_serialize PRIVATE simdjson::simdjson GTest::gtest_main)
+add_test(NAME test_serialize COMMAND test_serialize)
 
 # ── Exchange simulator (kalshi-sim) ──
 add_executable(kalshi-sim
