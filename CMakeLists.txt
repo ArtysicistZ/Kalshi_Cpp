@@ -126,6 +126,15 @@ target_include_directories(test_book PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_book PRIVATE simdjson::simdjson GTest::gtest_main)
 add_test(NAME test_book COMMAND test_book)
 
+add_executable(test_signal
+    test/test_signal.cpp
+    src/strategy/signal.cpp
+    src/feed/book.cpp
+)
+target_include_directories(test_signal PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_signal PRIVATE simdjson::simdjson GTest::gtest_main)
+add_test(NAME test_signal COMMAND test_signal)
+
 # ── Exchange simulator (kalshi-sim) ──
 add_executable(kalshi-sim
     sim/main.cpp
