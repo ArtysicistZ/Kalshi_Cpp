@@ -18,6 +18,7 @@ endif()
 
 # ── Find system libraries ──
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 # find_package(Boost REQUIRED COMPONENTS system)  # install first: pacman -S mingw-w64-ucrt-x86_64-boost
 
 # ── Fetch third-party libraries ──
@@ -109,6 +110,18 @@ add_executable(bench_hotpath
 )
 target_include_directories(bench_hotpath PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_hotpath PRIVATE simdjson::simdjson)
+
+add_executable(bench_hotpath_pipe
+    bench/bench_hotpath_pipe.cpp
+    src/feed/parser.cpp
+    src/feed/book.cpp
+    src/strategy/signal.cpp
+    src/strategy/order_manager.cpp
+    src/net/serialize.cpp
+    src/system/tuning.cpp
+)
+target_include_directories(bench_hotpath_pipe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_hotpath_pipe PRIVATE simdjson::simdjson Threads::Threads)
 
 add_executable(test_matching_engine
     test/test_matching_engine.cpp

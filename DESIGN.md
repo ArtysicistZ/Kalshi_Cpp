@@ -551,17 +551,38 @@ Microbenchmarks via Google Benchmark on x86-64 (22-core, 3072 MHz, 24 MB L3). Re
 
 Pool benchmarks use a 64-byte `Order` struct (one cache line). The pool never touches `malloc` after construction.
 
+### Hot Path Pipeline (parse → orderbook → signal → reconcile → serialize)
+
+Two benches measure the application-internal compute path. Both rotate over 1024 distinct synthetic orderbook-delta JSONs (xorshift64, fixed seed) and enforce zero-allocation in the measurement window via a global `new`/`delete` interposer (a counter bumps on any `malloc` during the timed loop; PASS = 0 bumps across all threads).
+
+- **`bench_hotpath`** (single-thread, 100 K iterations): full pipeline on one thread bracketed by `rdtsc()` / `rdtscp()`. Validates the per-stage compute floor with hot cache.
+- **`bench_hotpath_pipe`** (two-thread SPSC, 1 M iterations): producer parses then pushes a 72-byte `{OrderbookDelta, produce_tsc}` message over the existing `SPSCQueue`; consumer pops then applies → signals → reconciles → serializes; per-message latency = consumer's `rdtscp` minus producer's `rdtsc`. Producer and consumer pinned to distinct physical cores via `pthread_setaffinity_np`. `SCHED_FIFO` (priority 50) and `mlockall(MCL_CURRENT | MCL_FUTURE)` applied when CAP_SYS_NICE / CAP_IPC_LOCK granted; otherwise warn-and-continue.
+
+| Bench | Platform | min | p50 | p90 | p99 | p999 | max | throughput | zero-alloc |
+|---|---|---:|---:|---:|---:|---:|---:|---:|:---:|
+| `bench_hotpath` | WSL2 (i7-1370P) | 249 ns | **318 ns** | 399 ns | 618 ns | 1.02 µs | 186 µs | — | ✓ |
+| `bench_hotpath_pipe` (SCHED_FIFO, cores 16/18) | WSL2 (i7-1370P) | 282 ns | 571 ns | 720 ns | 94 µs | 348 µs | 533 µs | 2.92 M/s | ✓ |
+| `bench_hotpath_pipe` (SCHED_OTHER, cores 16/18 same-CCX) | Azure VM (EPYC 7V12) | 395 ns | **466 ns** | **486 ns** | **526 ns** | 16.2 µs | 105 µs | 3.15 M/s | ✓ |
+
+Notes:
+- Two-thread p99 collapses from 94 µs (WSL2 hypervisor-bounded) to 526 ns on a dedicated VM — the WSL2 tail was Hyper-V scheduler preemption, not pipeline jitter.
+- EPYC same-CCX (shared L3) pairing chosen via `lscpu --extended` to minimize cross-core handoff cost (~30 cycles L3-to-L1d migration vs ~80+ for cross-CCX).
+- 99.7 % of the 1 M EPYC iterations fell within a single 419–837 ns histogram bucket; the residual tail (kernel timer ticks) would tighten further with `isolcpus` / `nohz_full` on a bare-metal box.
+
 ### Caveats
 
-- Cross-thread RTT (348 ns) is higher than rigtorp's 133 ns Linux-pinned baseline because we don't yet have CPU pinning, `SCHED_FIFO`, or core isolation. Phase 4 (OS-level tuning) should close this gap.
+- Cross-thread RTT (348 ns) is higher than rigtorp's 133 ns Linux-pinned baseline because the SPSC microbench was run without pinning. The hot-path pipeline bench (above) uses `pthread_setaffinity_np` and shows the cross-core handoff is not the bottleneck in the full path.
 - Single-op `BM_Pool_AllocDealloc` (0.26 ns) likely reflects compiler optimization of the unused result; the churning number is what to cite externally.
 - Google Benchmark's "DEBUG" warning on MinGW/MSYS2 is spurious — Release flags are confirmed applied via `compile_commands.json`.
+- Hot-path numbers measure **application-internal compute latency** (parsed JSON in → wire bytes out), not tick-to-trade. Production tick-to-trade adds NIC↔userspace traversal (~1–5 µs with kernel-bypass, ~10–20 µs with TCP fast path), exchange RTT (sub-µs colocated, double-digit µs at LAN distance), and is what real HFT shops report with hardware-timestamped NICs.
+- Hardware-counter introspection (per-iteration cycles/IPC/cache-miss/branch-mispredict via `perf_event_open`) was deferred: deepx-3's `perf_event_paranoid=4` blocks userspace perf collection without root, and WSL2's PMU exposure under Hyper-V is uneven.
 
 ## Target Resume Bullet
 
 > **kalshi-cpp** | *Low-latency C++ prediction-market trading client + conformant exchange simulator* [GitHub]
 > - Built a complete low-latency trading stack in C++20: `kalshi-cpp`, a client implementing Kalshi's REST + WebSocket protocol with RSA-PSS request signing, and `kalshi-sim`, a **conformant exchange simulator** speaking the same protocol — used for reproducible end-to-end benchmarks and adversarial-scenario testing (forced disconnects, sequence-number gaps, partial fills, throttle storms).
-> - Lock-free SPSC queues, custom arena/pool/hash-map allocators, custom open-addressing Robin Hood hash table; zero heap allocations on the hot path. End-to-end p99 tick-to-trade latency under X µs measured against `kalshi-sim` with `tc netem`-injected 100 µs RTT (representative of colocated LAN).
+> - Lock-free SPSC queues, custom arena/pool/hash-map allocators, custom open-addressing Robin Hood hash table; zero heap allocations on the hot path, enforced via a global `new`/`delete` interposer that asserts zero `malloc` calls across all threads over the timed window.
+> - Zero-allocation cross-thread hot path (parse → orderbook → signal → reconciler → JSON serialize): **466 ns p50 / 486 ns p90 / 526 ns p99 / 3.15 M msgs/sec** end-to-end latency measured via `rdtsc`/`rdtscp` over 1 M iterations on AMD EPYC 7V12, with producer and consumer pinned to distinct physical cores on a shared-L3 CCX (`pthread_setaffinity_np`, `SCHED_FIFO`-ready, `mlockall`).
 > - Custom SPSC queue: 1 ns single-thread push/pop, 44 M items/sec cross-thread throughput — 30× faster than mutex-protected `std::queue` (single-thread, no contention).
 > - Custom pool allocator: 1.8 ns per order alloc/dealloc cycle — 4× faster than `malloc`, 8× faster than `std::list`, fully deterministic.
 > - Custom Robin Hood `FlatHashMap` (open addressing, backshift deletion, mmap-backed): 2× faster insert/erase and 1.2× faster steady-state churn vs `std::unordered_map`; find within 50% of std with strictly bounded tail latency (no rehash, no per-op allocation) — architecture aligned with Optiver/Jane Street public guidance for HFT containers.

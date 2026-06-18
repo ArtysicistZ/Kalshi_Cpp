@@ -4,13 +4,13 @@
 
 **A low-latency C++20 trading stack for the Kalshi prediction market, with a conformant exchange simulator to benchmark against.**
 
-[![Tick-to-trade sub-3 µs p50 · sub-10 µs p99 · 5 M+ msg/s · zero-alloc hot path](https://img.shields.io/badge/Tick--to--trade-sub--3%20%C2%B5s%20p50%20%C2%B7%20sub--10%20%C2%B5s%20p99%20%C2%B7%205M%2B%20msg%2Fs%20%C2%B7%20zero--alloc-2a9d8f?style=for-the-badge)](#measured-results)
+[![Hot-path 466 ns p50 · 526 ns p99 · 3.15 M msg/s · zero-alloc verified](https://img.shields.io/badge/Hot--path-466%20ns%20p50%20%C2%B7%20526%20ns%20p99%20%C2%B7%203.15%20M%20msg%2Fs%20%C2%B7%20zero--alloc%20verified-2a9d8f?style=for-the-badge)](#measured-results)
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](./CMakeLists.txt) [![Linux x86-64](https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&logoColor=black)](#platform) [![Boost.Asio + io_uring](https://img.shields.io/badge/Boost.Asio-io__uring-orange)](https://www.boost.org/doc/libs/release/libs/asio/) [![Boost.Beast WebSocket](https://img.shields.io/badge/Boost.Beast-WebSocket-orange)](https://www.boost.org/doc/libs/release/libs/beast/) [![OpenSSL RSA-PSS](https://img.shields.io/badge/OpenSSL-RSA--PSS-721412?logo=openssl&logoColor=white)](https://www.openssl.org/) [![simdjson](https://img.shields.io/badge/simdjson-zero--copy-blueviolet)](https://github.com/simdjson/simdjson) [![Google Benchmark](https://img.shields.io/badge/Google%20Benchmark-microbench-4285F4?logo=google&logoColor=white)](https://github.com/google/benchmark) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 <br />
 
-[Results](#measured-results) &bull; [Why This Exists](#why-this-exists) &bull; [Architecture](#architecture) &bull; [Hot Path](#hot-path) &bull; [Simulator](#the-simulator-kalshi-sim) &bull; [Quick Start](#quick-start) &bull; [Tuning](#per-knob-network-stack-tuning)
+[Results](#measured-results) &bull; [Why This Exists](#why-this-exists) &bull; [Architecture](#architecture) &bull; [Hot Path](#hot-path) &bull; [Simulator](#the-simulator-kalshi-sim) &bull; [Quick Start](#quick-start) &bull; [Reproduce](#reproducing-the-headline-number)
 
 </div>
 
@@ -22,65 +22,87 @@ There is no C++ client for any prediction market. Every existing Kalshi or Polym
 
 Trading directly against the live exchange is a non-starter for an open-source project. Kalshi's demo and production environments require SSN and KYC. The repository therefore ships **`kalshi-sim`**, a conformant exchange written in C++ that speaks Kalshi's wire protocol byte for byte (RSA-PSS-signed REST and WebSocket market data) and runs a price-time-priority CLOB. The simulator is what makes end-to-end benchmarks possible at all, and what makes adversarial scenarios (forced disconnects, sequence-number gaps, partial fills, throttle storms) testable on demand. Both processes are optimized to the same standard, so measured tick-to-trade latency reflects the protocol and network stack rather than server-side sloppiness.
 
-Headline numbers: median tick-to-trade is **sub-3 µs**, p99 is **sub-10 µs**, sustained ingest is **5 M+ market-data updates/sec**. The hot path performs **zero heap allocations**, verified by overriding global `operator new` in debug builds.
+Headline numbers measure the **application-internal hot path** (`parse → orderbook → signal → reconcile → wire-serialize`) across two CPU-pinned threads connected by a lock-free SPSC queue: **466 ns p50 / 526 ns p99 / 3.15 M msg/s sustained**, on AMD EPYC 7V12, over 1 million iterations. The hot path performs **zero heap allocations** — verified, not asserted, by a global `operator new` interposer that bumps a counter on every `malloc` during the timed window (counter must read 0 to pass). End-to-end *tick-to-trade* (NIC ↔ userspace ↔ exchange) is a separate budget not yet measured in this repo; see [Caveats](#caveats).
 
 ---
 
 ## Measured Results
 
-### End-to-end tick-to-trade (against `kalshi-sim`, `tc netem` LAN profile)
+### Hot path pipeline (parse → orderbook → signal → reconcile → serialize)
 
-`Wire arrival at client NIC → JSON parse → orderbook delta apply → strategy decision → signed REST order on the wire.`
+Two-thread SPSC pipeline. Producer parses JSON and pushes timestamped `OrderbookDelta` messages over a lock-free queue; consumer pops, applies to a flat-array book, evaluates the signal, reconciles desired vs. live orders, and serializes resulting `Action`s to wire bytes. Per-message latency is measured `rdtscp_consumer − rdtsc_producer`; both threads are CPU-pinned to distinct physical cores on a shared-L3 CCX. **Zero heap allocations** in the timed window are *enforced* — a global `operator new` interposer bumps a thread-shared counter on every `malloc`; the bench reports PASS only when the counter is 0.
 
 <div align="center">
 
-| Metric                              |   Value   | Baseline (default kernel sockopts) |  Improvement |
-|-------------------------------------|:---------:|:----------------------------------:|:------------:|
-| **Tick-to-trade p50**               | **2.4 µs** |             12.4 µs                |   **5.2×**   |
-| **Tick-to-trade p99**               | **7.6 µs** |             38.1 µs                |   **5.0×**   |
-| **Tick-to-trade p999**              |  22.4 µs  |             142 µs                 |    **6.3×**   |
-| **Sustained ingest**                | **5.1 M msg/s** |          0.46 M msg/s          |    **11×**   |
-| **Heap allocations on hot path**    |   **0**   |               n/a                  |  verified    |
-| **Jitter (max − p99) over 5 min**   |   7.8 µs  |             104 µs                 |              |
+| Metric                              |     Value      |  Notes  |
+|-------------------------------------|:--------------:|:--------|
+| **End-to-end p50**                  | **466 ns**     | parse + push + cross-L1d handoff + pop + compute + serialize |
+| **End-to-end p90**                  |    486 ns      | 99.7 % of messages clear in &lt; 837 ns |
+| **End-to-end p99**                  | **526 ns**     | unimodal — no compute-side fat tail   |
+| **End-to-end p99.9**                |   16.2 µs      | residual kernel-tick preemption (regular Linux, no `nohz_full`) |
+| **Sustained throughput**            | **3.15 M msg/s** | bottleneck is consumer-side compute (~317 ns/msg) |
+| **Heap allocations / 1 M messages** |    **0**       | enforced via global `new`/`delete` interposer |
+| **Cycles per message (p50)**        |   1,139        | ≈ 466 ns at 2.45 GHz boost |
 
-*Profile: `tc qdisc add dev lo root netem delay 100us 20us` (LAN-class). Single 22-core x86-64 host, two CPU-pinned worker threads (net + strategy), `SCHED_FIFO`, `mlockall`, huge pages, `io_uring`. Reproduced via [`bench/bench_e2e.cpp`](bench/bench_e2e.cpp).*
+*Platform: Azure VM, AMD EPYC 7V12 64-Core (96 logical CPUs, no SMT), Ubuntu 24.04, kernel 6.17. Cores 16 and 18 (same L3 CCX, NUMA node 0). Release build `-O3 -march=native -flto -fno-exceptions -fno-rtti`. 1 M iterations after 10 K warmup. Reproduced via [`bench/bench_hotpath_pipe.cpp`](bench/bench_hotpath_pipe.cpp); raw cycle counts dumped to `/tmp/bench_hotpath_pipe_cycles.bin`; histogram rendered by [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py).*
 
 </div>
 
 <div align="center">
-<sub><b>Wire-to-trade decomposition (p50, ns)</b></sub>
-
-| Stage                | ns    | %    |
-|----------------------|------:|:----:|
-| Kernel to user (io_uring CQE) |   520 | 22%  |
-| simdjson parse       |   680 | 28%  |
-| Orderbook delta apply|   270 | 11%  |
-| Strategy decision    |   230 | 10%  |
-| RSA-PSS sign         |   410 | 17%  |
-| User to kernel (sendto) |  290 | 12%  |
-| **Total**            | **2400** | 100% |
-
+<img src="docs/hotpath_latency_histogram.png" alt="Hot-path latency histogram, 1M messages, AMD EPYC 7V12, log-log axes" width="900" />
+<br />
+<sub><b>End-to-end per-message latency across 1 M iterations.</b> Log-log axes; main mode at ~1 µs holds 99.7 % of samples; residual tail (kernel timer preemption) terminates near 100 µs. p50/p90/p99/p99.9 markers overlaid.</sub>
 </div>
 
-### Microbenchmarks (verified, Google Benchmark)
+### Tuning ablation
 
-Numbers below are taken on the development workstation (x86-64, 22-core, 3.07 GHz, 24 MB L3, Release build `-O3 -march=native -flto`). The full ablation table lives in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md).
+Each row applies one additional production-hardening knob. Same bench, same payload distribution; only the OS/topology configuration changes.
 
 <div align="center">
 
-| Component                         | Operation                          |    This project   |     Standard library     | Speedup    |
-|-----------------------------------|------------------------------------|:-----------------:|:------------------------:|:----------:|
-| **SPSC queue**                    | single-thread push/pop (int)       |    **1.01 ns**    | mutex `std::queue`: 30.5 ns | **30×**  |
-| **SPSC queue**                    | cross-thread sustained             |   **44 M item/s** | mutex `std::queue`: 8.9 M | **5×**   |
-| **Pool allocator**                | realistic alloc + write + dealloc  |    **0.76 ns**    | `malloc` / `free`: 8.97 ns | **12×**  |
-| **Pool allocator**                | sustained throughput               | **776 M op/s**    | `malloc` / `free`: 163 M  | **4.8×** |
-| **Robin Hood `FlatHashMap`**      | insert at 200K entries (p99)       |    **64 ns**      | `std::unordered_map`: 510 ns | **8×** |
-| **Robin Hood `FlatHashMap`**      | lookup at 200K entries (p50)       |       16 ns       | `std::unordered_map`: 82 ns  | **5×** |
-| **rdtsc clock**                   | timestamp acquisition              |    **8 cycles**   |  `clock_gettime`: 21 ns   |          |
+| Configuration                                                  | p50      | p99       | p99.9    | throughput   | platform                |
+|----------------------------------------------------------------|:--------:|:---------:|:--------:|:------------:|:------------------------|
+| Single-thread baseline (no queue handoff)                      |  318 ns  |   618 ns  |  1.02 µs |      —       | WSL2 (i7-1370P)         |
+| Two-thread, pinned to IRQ-busy cores (CPU 2 / 4)               |  695 ns  |  252 µs   |  5.50 ms | 2.31 M/s     | WSL2 (i7-1370P)         |
+| &nbsp;&nbsp;`+ SCHED_FIFO` + `mlockall`                        |  499 ns  |  183 µs   |  1.13 ms | 3.39 M/s     | WSL2 (i7-1370P, sudo)   |
+| &nbsp;&nbsp;`+` move off IRQ-busy cores (CPU 16 / 18)          |  571 ns  |   94 µs   |  348 µs  | 2.92 M/s     | WSL2 (i7-1370P, sudo)   |
+| Quiet dedicated VM, same-L3 CCX (CPU 16 / 18)                  | **466 ns** | **526 ns** | **16.2 µs** | **3.15 M/s** | Azure EPYC 7V12          |
 
 </div>
 
-Every row above is a primitive on the tick-to-trade hot path. The numbers are emitted by [`bench/bench_spsc.cpp`](bench/bench_spsc.cpp), [`bench/bench_pool.cpp`](bench/bench_pool.cpp), and [`bench/bench_flat_hash_map.cpp`](bench/bench_flat_hash_map.cpp). The end-to-end number is what you get when they compose.
+Each step's impact, in order:
+- **`SCHED_FIFO` + `mlockall`** (row 3): outranks softirq/CFS so kernel interrupt handlers stop preempting mid-iteration; page locking eliminates minor-fault outliers. p50 −28 %, throughput +47 %.
+- **Quiet cores** (row 4): `/proc/interrupts` showed `virtio0-virtqueues` MSI pinned to CPU 2 — every NIC interrupt was preempting our producer. Moving to CPUs far from the boot CPU and the IRQ-host cores shrinks the 5 – 40 µs scheduler-noise bump. p99 ↓ 2× (183 → 94 µs).
+- **Dedicated VM, same-L3 CCX** (row 5): no Windows host scheduler stealing vCPUs; no Hyper-V multi-tasking; producer/consumer pinned to two cores in the same EPYC CCX share L3, so the SPSC slot's cache line migrates within one CCX (~30 cycles) rather than crossing CCXs. p99 collapses **178× (94 µs → 526 ns)**. This is the canonical headline number.
+
+The remaining p99.9 = 16 µs floor is the regular Linux timer tick (`LOC` interrupts) — bare metal with `isolcpus` / `nohz_full` would tighten it further.
+
+### Microbenchmarks (Google Benchmark)
+
+Per-operation latency on the development workstation (Intel i7-1370P, WSL2, 22 logical CPUs, Release `-O3 -march=native -flto`). Numbers are mean per-op unless noted. Emitted by [`bench/bench_spsc.cpp`](bench/bench_spsc.cpp) and [`bench/bench_pool.cpp`](bench/bench_pool.cpp).
+
+<div align="center">
+
+| Component                         | Operation                          |    This project   |     Standard library          | Speedup    |
+|-----------------------------------|------------------------------------|:-----------------:|:-----------------------------:|:----------:|
+| **SPSC queue**                    | single-thread push/pop (int)       |    **1.01 ns**    | `std::queue`: 1.18 ns         |     —      |
+| **SPSC queue**                    | single-thread push/pop (108-byte struct) |   8.05 ns   | dominated by payload memcpy    |     —      |
+| **SPSC queue**                    | single-thread w/ mutex (no contention) |   30.5 ns    | mutex `std::queue`            | **30×**    |
+| **SPSC queue**                    | cross-thread sustained             |   **44 M item/s** | mutex `std::queue`: 8.9 M     | **5×**     |
+| **Pool allocator**                | realistic alloc + field write + free |  **0.76 ns**    | `malloc` / `free`: 8.97 ns    | **12×**    |
+| **Pool allocator**                | 1024-order steady-state churn      |    **1.80 ns**    | `malloc` / `free`: 7.72 ns;<br>`std::list` push/pop: 14.9 ns | **4 – 8×** |
+| **Pool allocator**                | sustained throughput               | **776 M op/s**    | `malloc` / `free`: 163 M      | **4.8×**   |
+
+</div>
+
+These are the primitives the hot path is built from. The hot-path bench above is what you get when they compose under realistic two-thread queueing.
+
+### Caveats
+
+- **Measurement boundary.** The hot-path numbers cover parsed-bytes-in to wire-bytes-out — *application-internal compute latency*. Production *tick-to-trade* additionally includes NIC ↔ userspace traversal (~1–5 µs with kernel-bypass, ~10–20 µs with the TCP fast path) and the exchange round trip (sub-µs colocated, double-digit µs at LAN distance). Real HFT firms report tick-to-trade with hardware-timestamped NICs; that path is on the design roadmap but not in the current measurement.
+- **Platforms.** WSL2 rows are bounded below by the Hyper-V hypervisor scheduler (~100 µs preemptions that no in-VM syscall can reach). The EPYC row is bounded by the regular Linux timer tick. Bare metal with `isolcpus` / `nohz_full` / `rcu_nocbs` is the next floor.
+- **Cross-core TSC.** Both `rdtsc` reads are on different physical cores; correctness depends on invariant TSC. EPYC 7V12 exposes `constant_tsc`, `nonstop_tsc`, `tsc_known_freq`, `tsc_reliable`; verified via `/proc/cpuinfo`.
+- **Hardware-counter introspection** (per-iteration cycles/IPC/cache-miss/branch-mispredict via `perf_event_open`) is deferred: deepx-3 sets `perf_event_paranoid=4`, blocking userspace perf collection without root; WSL2 PMU exposure under Hyper-V is uneven.
 
 ---
 
@@ -132,7 +154,7 @@ Boost.Asio abstracts the kernel interface. On Linux 5.15+ the build picks `io_ur
 
 ## Hot Path
 
-Everything between a TCP segment hitting the NIC and an RSA-PSS-signed POST order leaving the kernel runs without a single heap allocation. That property is why the p99 number is what it is. If anything on the hot path takes a page fault or calls into `malloc`, the tail blows up by orders of magnitude.
+The path from parsed-bytes-in to wire-bytes-out — parse, orderbook delta apply, signal evaluation, order reconciliation, JSON serialization — runs without a single heap allocation. That property is why the p99 number is what it is. If anything on the hot path takes a page fault or calls into `malloc`, the tail blows up by orders of magnitude. The same discipline extends out to the NIC boundaries (`io_uring` receive, RSA-PSS-signed REST, `mmap`-backed arena for incoming frames) in the surrounding design; those layers are on the roadmap.
 
 <div align="center">
 
@@ -154,26 +176,33 @@ All primitives are implemented in [`src/core/`](src/core/) and exercised by both
 
 ---
 
-## Per-Knob Network-Stack Tuning
+## Reproducing the headline number
 
-Each Phase-4 knob ships with a before/after measurement against the simulator under a `tc netem` profile. The table below is for the LAN profile (`100 µs ± 20 µs`).
+The hot-path bench is fully self-contained — no exchange, no simulator, no network. It builds and runs on any Linux x86-64 box with CMake ≥ 3.20 and GCC ≥ 12.
 
-<div align="center">
+```bash
+# Build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target bench_hotpath_pipe -j
 
-| Configuration                                 | p50 (µs) | p99 (µs) | Δ vs prev | Notes                                                            |
-|-----------------------------------------------|:--------:|:--------:|:---------:|------------------------------------------------------------------|
-| Baseline (default sockopts, `epoll`)          |   12.4   |   38.1   |     —     | Naive client, no tuning.                                         |
-| `+ TCP_NODELAY`                               |    8.6   |   26.4   | **−31%** | Nagle off, single-message orders ship immediately.               |
-| `+ SO_BUSY_POLL` (50 µs)                      |    6.4   |   18.7   | **−26%** | Kernel polls NIC; trades a core for about 3 µs wakeup win.       |
-| `+ TCP_QUICKACK`                              |    6.0   |   16.8   |  −7%      | Disables delayed ACKs on receive.                                |
-| `+ io_uring` backend                          |    4.1   |   12.3   | **−32%** | Submission/completion-queue model, syscall-free steady state.    |
-| `+ CPU pin (cores 1 & 2)`                     |    3.2   |    9.8   | −22%     | Eliminates scheduler-induced jitter, avoids core 0 (IRQs).       |
-| `+ SCHED_FIFO + mlockall`                     |    2.6   |    8.1   | −19%     | No preemption, no page faults after startup.                     |
-| `+ huge pages (MAP_HUGETLB)`                  | **2.4**  | **7.6**  | −7%      | Fewer TLB misses on the order book and arena.                    |
+# Pick two CPUs on the same physical core complex / shared L3.
+# Inspect topology first:
+lscpu --extended | head -20       # CORE and L3 columns matter
+cat /proc/interrupts | head -20   # avoid CPUs hosting busy IRQs
 
-</div>
+# Edit CORE_PRODUCER / CORE_CONSUMER in bench/bench_hotpath_pipe.cpp,
+# rebuild, then run. Add sudo for SCHED_FIFO + mlockall to take effect.
+sudo ./build/bench_hotpath_pipe
+```
 
-The last row is what the headline badge refers to. Each step is reproducible from the simulator under a fixed `tc netem` profile via [`bench/bench_e2e.cpp`](bench/bench_e2e.cpp) and the scripts in [`scripts/`](scripts/). Kernel-bypass paths (Solarflare `ef_vi`, Mellanox `ibverbs`, DPDK) are documented in [`docs/PRODUCTION_TUNING.md`](docs/PRODUCTION_TUNING.md). They require physical NICs and are not in the headline number.
+Output prints min / p50 / p90 / p99 / p99.9 / max in both TSC cycles and nanoseconds, sustained throughput, the zero-allocation PASS/FAIL line, and an ASCII log2-bucket histogram. The raw per-message cycle counts are also dumped to `/tmp/bench_hotpath_pipe_cycles.bin` for offline analysis; [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py) renders the matplotlib histogram shown above.
+
+For tightest measurements, prefer:
+- Cores on the **same L3 CCX** (`lscpu --extended`, match the `L3` column).
+- Cores **off** any CPU that `/proc/interrupts` shows as hosting NIC / NVMe MSI IRQs.
+- `sudo` so `SCHED_FIFO` priority 50 and `mlockall(MCL_CURRENT | MCL_FUTURE)` actually take effect; otherwise the bench prints warnings and falls back to `SCHED_OTHER`.
+
+Production network-stack knobs (`TCP_NODELAY`, `SO_BUSY_POLL`, `TCP_QUICKACK`, `io_uring`, huge pages, kernel-bypass NIC paths via Solarflare `ef_vi` / DPDK) and an end-to-end tick-to-trade bench against `kalshi-sim` under `tc netem` are on the roadmap; current measurements do not include them.
 
 ---
 
@@ -272,16 +301,20 @@ Only environment variables change. Point `KALSHI_API_BASE` and `KALSHI_WS_URL` a
 ### Benchmarks and tests
 
 ```bash
-# Microbenchmarks
-./build/bench/bench_spsc
-./build/bench/bench_pool
-./build/bench/bench_flat_hash_map
+# Hot-path pipeline (headline number — see Measured Results)
+sudo ./build/bench_hotpath_pipe        # 2-thread SPSC pipeline, CPU-pinned, SCHED_FIFO + mlockall
+./build/bench_hotpath                  # single-thread compute floor (no queue handoff)
 
-# End-to-end vs kalshi-sim (under whichever tc netem profile is loaded)
-./build/bench/bench_e2e --duration 300 --report-percentiles
+# Component microbenchmarks (Google Benchmark)
+./build/bench_spsc
+./build/bench_pool
+
+# Render the latency histogram from the most recent pipe run
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate motus    # or any env with matplotlib + numpy
+python script/plot_hotpath_hist.py --out docs/hotpath_latency_histogram.png
 
 # Tests
-ctest --output-on-failure
+ctest --output-on-failure              # parser, book, signal, order_manager, serialize, spsc, pool, matching_engine
 ```
 
 ---
