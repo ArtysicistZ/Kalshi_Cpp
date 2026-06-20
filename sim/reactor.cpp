@@ -2,7 +2,7 @@
 
 #include <cstdio>
 #include <cerrno>
-#include <sys/epoll.h>
+#include "sim/compat/epoll_shim.h"
 #include <unistd.h>
 
 namespace kalshi::sim {

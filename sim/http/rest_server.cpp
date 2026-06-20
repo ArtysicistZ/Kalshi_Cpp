@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/socket.h>
-#include <sys/epoll.h>
+#include "sim/compat/epoll_shim.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
