@@ -4,7 +4,7 @@
 
 **A low-latency C++20 trading stack for the Kalshi prediction market, with a conformant exchange simulator to benchmark against.**
 
-[![Hot-path 466 ns p50 · 526 ns p99 · 3.15 M msg/s · zero-alloc verified](https://img.shields.io/badge/Hot--path-466%20ns%20p50%20%C2%B7%20526%20ns%20p99%20%C2%B7%203.15%20M%20msg%2Fs%20%C2%B7%20zero--alloc%20verified-2a9d8f?style=for-the-badge)](#measured-results)
+[![Hot-path 486 ns p50 · 576 ns p99 · 3.18 M msg/s · 256-ticker dispatch · zero-alloc verified](https://img.shields.io/badge/Hot--path-486%20ns%20p50%20%C2%B7%20576%20ns%20p99%20%C2%B7%203.18%20M%20msg%2Fs%20%C2%B7%20256--ticker%20dispatch%20%C2%B7%20zero--alloc%20verified-2a9d8f?style=for-the-badge)](#measured-results)
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](./CMakeLists.txt) [![Linux x86-64](https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&logoColor=black)](#platform) [![Boost.Asio + io_uring](https://img.shields.io/badge/Boost.Asio-io__uring-orange)](https://www.boost.org/doc/libs/release/libs/asio/) [![Boost.Beast WebSocket](https://img.shields.io/badge/Boost.Beast-WebSocket-orange)](https://www.boost.org/doc/libs/release/libs/beast/) [![OpenSSL RSA-PSS](https://img.shields.io/badge/OpenSSL-RSA--PSS-721412?logo=openssl&logoColor=white)](https://www.openssl.org/) [![simdjson](https://img.shields.io/badge/simdjson-zero--copy-blueviolet)](https://github.com/simdjson/simdjson) [![Google Benchmark](https://img.shields.io/badge/Google%20Benchmark-microbench-4285F4?logo=google&logoColor=white)](https://github.com/google/benchmark) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
@@ -22,36 +22,38 @@ There is no C++ client for any prediction market. Every existing Kalshi or Polym
 
 Trading directly against the live exchange is a non-starter for an open-source project. Kalshi's demo and production environments require SSN and KYC. The repository therefore ships **`kalshi-sim`**, a conformant exchange written in C++ that speaks Kalshi's wire protocol byte for byte (RSA-PSS-signed REST and WebSocket market data) and runs a price-time-priority CLOB. The simulator is what makes end-to-end benchmarks possible at all, and what makes adversarial scenarios (forced disconnects, sequence-number gaps, partial fills, throttle storms) testable on demand. Both processes are optimized to the same standard, so measured tick-to-trade latency reflects the protocol and network stack rather than server-side sloppiness.
 
-Headline numbers measure the **application-internal hot path** (`parse → orderbook → signal → reconcile → wire-serialize`) across two CPU-pinned threads connected by a lock-free SPSC queue: **466 ns p50 / 526 ns p99 / 3.15 M msg/s sustained**, on AMD EPYC 7V12, over 1 million iterations. The hot path performs **zero heap allocations** — verified, not asserted, by a global `operator new` interposer that bumps a counter on every `malloc` during the timed window (counter must read 0 to pass). End-to-end *tick-to-trade* (NIC ↔ userspace ↔ exchange) is a separate budget not yet measured in this repo; see [Caveats](#caveats).
+Headline numbers measure the **application-internal hot path** (`parse → FlatHashMap dispatch over 256 tickers → orderbook → signal → reconcile → wire-serialize`) across two CPU-pinned threads connected by a lock-free SPSC queue: **486 ns p50 / 576 ns p99 / 3.18 M msg/s sustained**, on AMD EPYC 7V12, over 1 million iterations. Every message hashes its ticker string (FNV-1a 64-bit), looks up the corresponding per-market `Book + Signal + OrderManager` state through a Robin Hood `FlatHashMap`, and dispatches into a `Pool`-backed `MarketState`. The hot path performs **zero heap allocations** across all three composed primitives (SPSC queue + FlatHashMap + Pool) — verified, not asserted, by a global `operator new` interposer that bumps a counter on every `malloc` during the timed window (counter must read 0 to pass). End-to-end *tick-to-trade* (NIC ↔ userspace ↔ exchange) is a separate budget not yet measured in this repo; see [Caveats](#caveats).
 
 ---
 
 ## Measured Results
 
-### Hot path pipeline (parse → orderbook → signal → reconcile → serialize)
+### Hot path pipeline (parse → FlatHashMap dispatch → orderbook → signal → reconcile → serialize)
 
-Two-thread SPSC pipeline. Producer parses JSON and pushes timestamped `OrderbookDelta` messages over a lock-free queue; consumer pops, applies to a flat-array book, evaluates the signal, reconciles desired vs. live orders, and serializes resulting `Action`s to wire bytes. Per-message latency is measured `rdtscp_consumer − rdtsc_producer`; both threads are CPU-pinned to distinct physical cores on a shared-L3 CCX. **Zero heap allocations** in the timed window are *enforced* — a global `operator new` interposer bumps a thread-shared counter on every `malloc`; the bench reports PASS only when the counter is 0.
+Two-thread SPSC pipeline across **256 distinct tickers**. Producer parses JSON and pushes timestamped `{OrderbookDelta, produce_tsc}` messages over a lock-free queue; consumer pops, hashes the ticker string (FNV-1a 64-bit), looks up the per-market state through a Robin Hood `FlatHashMap<TickerKey, MarketState*, 1024>`, applies the delta to a flat-array book, evaluates the signal, reconciles desired vs. live orders, and serializes resulting `Action`s to wire bytes. The 256 `MarketState` instances are allocated up-front from a fixed-capacity `Pool<MarketState, 256>`. Per-message latency is measured `rdtscp_consumer − rdtsc_producer`; both threads are CPU-pinned to distinct physical cores on a shared-L3 CCX. **Zero heap allocations** in the timed window are *enforced* across all three composed primitives (SPSC queue + FlatHashMap + Pool) — a global `operator new` interposer bumps a thread-shared counter on every `malloc`; the bench reports PASS only when the counter is 0.
 
 <div align="center">
 
 | Metric                              |     Value      |  Notes  |
 |-------------------------------------|:--------------:|:--------|
-| **End-to-end p50**                  | **466 ns**     | parse + push + cross-L1d handoff + pop + compute + serialize |
-| **End-to-end p90**                  |    486 ns      | 99.7 % of messages clear in &lt; 837 ns |
-| **End-to-end p99**                  | **526 ns**     | unimodal — no compute-side fat tail   |
-| **End-to-end p99.9**                |   16.2 µs      | residual kernel-tick preemption (regular Linux, no `nohz_full`) |
-| **Sustained throughput**            | **3.15 M msg/s** | bottleneck is consumer-side compute (~317 ns/msg) |
-| **Heap allocations / 1 M messages** |    **0**       | enforced via global `new`/`delete` interposer |
-| **Cycles per message (p50)**        |   1,139        | ≈ 466 ns at 2.45 GHz boost |
+| **End-to-end p50**                  | **486 ns**     | parse + push + cross-L1d handoff + pop + hash + map lookup + compute + serialize |
+| **End-to-end p90**                  |    536 ns      | 99.8 % of messages clear in &lt; 837 ns |
+| **End-to-end p99**                  | **576 ns**     | unimodal — no compute-side fat tail   |
+| **End-to-end p99.9**                |    3.00 µs     | residual kernel-tick preemption (regular Linux, no `nohz_full`) |
+| **End-to-end max**                  |    81 µs       | single-event scheduler-class outlier  |
+| **Sustained throughput**            | **3.18 M msg/s** | bottleneck is consumer-side compute (~314 ns/msg) |
+| **FlatHashMap dispatch cost**       | ~20 ns p50 / ~50 ns p99 | one FNV-1a over 32-byte ticker + one Robin Hood probe at ~25 % load factor |
+| **Heap allocations / 1 M messages** |    **0**       | enforced across SPSC + FlatHashMap + Pool via global `new`/`delete` interposer |
+| **Cycles per message (p50)**        |   1,188        | ≈ 486 ns at 2.45 GHz boost |
 
-*Platform: Azure VM, AMD EPYC 7V12 64-Core (96 logical CPUs, no SMT), Ubuntu 24.04, kernel 6.17. Cores 16 and 18 (same L3 CCX, NUMA node 0). Release build `-O3 -march=native -flto -fno-exceptions -fno-rtti`. 1 M iterations after 10 K warmup. Reproduced via [`bench/bench_hotpath_pipe.cpp`](bench/bench_hotpath_pipe.cpp); raw cycle counts dumped to `/tmp/bench_hotpath_pipe_cycles.bin`; histogram rendered by [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py).*
+*Platform: Azure VM, AMD EPYC 7V12 64-Core (96 logical CPUs, no SMT), Ubuntu 24.04, kernel 6.17. Cores 16 and 18 (same L3 CCX, NUMA node 0). Release build `-O3 -march=native -flto -fno-exceptions -fno-rtti`. 1 M iterations after 10 K warmup, 256 tickers round-robined uniformly. Reproduced via [`bench/bench_hotpath_multi.cpp`](bench/bench_hotpath_multi.cpp); raw cycle counts dumped to `/tmp/bench_hotpath_multi_cycles.bin`; histogram rendered by [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py).*
 
 </div>
 
 <div align="center">
 <img src="docs/hotpath_latency_histogram.png" alt="Hot-path latency histogram, 1M messages, AMD EPYC 7V12, log-log axes" width="900" />
 <br />
-<sub><b>End-to-end per-message latency across 1 M iterations.</b> Log-log axes; main mode at ~1 µs holds 99.7 % of samples; residual tail (kernel timer preemption) terminates near 100 µs. p50/p90/p99/p99.9 markers overlaid.</sub>
+<sub><b>End-to-end per-message latency across 1 M iterations (1-ticker compute floor).</b> Log-log axes; main mode at ~1 µs holds 99.7 % of samples; residual tail (kernel timer preemption) terminates near 100 µs. p50/p90/p99/p99.9 markers overlaid. The 256-ticker dispatch shifts the main mode right by ~20 ns at p50 and ~50 ns at p99 (see the metric table above) and tightens the residual tail (p99.9 drops 16.2 µs → 3.0 µs, max 105 µs → 81 µs across the run).</sub>
 </div>
 
 ### Tuning ablation
@@ -66,16 +68,18 @@ Each row applies one additional production-hardening knob. Same bench, same payl
 | Two-thread, pinned to IRQ-busy cores (CPU 2 / 4)               |  695 ns  |  252 µs   |  5.50 ms | 2.31 M/s     | WSL2 (i7-1370P)         |
 | &nbsp;&nbsp;`+ SCHED_FIFO` + `mlockall`                        |  499 ns  |  183 µs   |  1.13 ms | 3.39 M/s     | WSL2 (i7-1370P, sudo)   |
 | &nbsp;&nbsp;`+` move off IRQ-busy cores (CPU 16 / 18)          |  571 ns  |   94 µs   |  348 µs  | 2.92 M/s     | WSL2 (i7-1370P, sudo)   |
-| Quiet dedicated VM, same-L3 CCX (CPU 16 / 18)                  | **466 ns** | **526 ns** | **16.2 µs** | **3.15 M/s** | Azure EPYC 7V12          |
+| Quiet dedicated VM, same-L3 CCX (CPU 16 / 18), 1 ticker        |  466 ns  |   526 ns  |  16.2 µs |  3.15 M/s    | Azure EPYC 7V12          |
+| &nbsp;&nbsp;`+` 256-ticker FlatHashMap dispatch + Pool state   | **486 ns** | **576 ns** | **3.00 µs** | **3.18 M/s** | Azure EPYC 7V12 (headline) |
 
 </div>
 
 Each step's impact, in order:
 - **`SCHED_FIFO` + `mlockall`** (row 3): outranks softirq/CFS so kernel interrupt handlers stop preempting mid-iteration; page locking eliminates minor-fault outliers. p50 −28 %, throughput +47 %.
 - **Quiet cores** (row 4): `/proc/interrupts` showed `virtio0-virtqueues` MSI pinned to CPU 2 — every NIC interrupt was preempting our producer. Moving to CPUs far from the boot CPU and the IRQ-host cores shrinks the 5 – 40 µs scheduler-noise bump. p99 ↓ 2× (183 → 94 µs).
-- **Dedicated VM, same-L3 CCX** (row 5): no Windows host scheduler stealing vCPUs; no Hyper-V multi-tasking; producer/consumer pinned to two cores in the same EPYC CCX share L3, so the SPSC slot's cache line migrates within one CCX (~30 cycles) rather than crossing CCXs. p99 collapses **178× (94 µs → 526 ns)**. This is the canonical headline number.
+- **Dedicated VM, same-L3 CCX** (row 5): no Windows host scheduler stealing vCPUs; no Hyper-V multi-tasking; producer/consumer pinned to two cores in the same EPYC CCX share L3, so the SPSC slot's cache line migrates within one CCX (~30 cycles) rather than crossing CCXs. p99 collapses **178× (94 µs → 526 ns)**. Establishes the 1-ticker compute floor.
+- **256-ticker dispatch** (row 6, headline): adds one FNV-1a hash over the 32-byte ticker and one Robin Hood `find()` probe per message, against a `FlatHashMap` at ~25 % load factor; per-market `Book + Signal + OrderManager` state lives in a `Pool<MarketState, 256>` allocated up-front. Dispatch costs ~20 ns at p50 and ~50 ns at p99 — exactly the predicted cost of one cache-line load — and brings the production-realistic scenario online while the zero-allocation invariant continues to hold across all three composed primitives (SPSC + FlatHashMap + Pool). Throughput slightly improves to 3.18 M msg/s.
 
-The remaining p99.9 = 16 µs floor is the regular Linux timer tick (`LOC` interrupts) — bare metal with `isolcpus` / `nohz_full` would tighten it further.
+The remaining p99.9 = 3 µs / max ≈ 81 µs floor is the regular Linux timer tick (`LOC` interrupts) and one stray scheduler-class outlier — bare metal with `isolcpus` / `nohz_full` would tighten both.
 
 ### Microbenchmarks (Google Benchmark)
 
@@ -95,7 +99,7 @@ Per-operation latency on the development workstation (Intel i7-1370P, WSL2, 22 l
 
 </div>
 
-These are the primitives the hot path is built from. The hot-path bench above is what you get when they compose under realistic two-thread queueing.
+These are the primitives the hot path is built from. The hot-path bench above is what you get when **SPSC queue + Robin Hood `FlatHashMap` + intrusive `Pool`** compose under realistic two-thread queueing with 256 dispatch keys — and the zero-allocation guarantee holds across all three simultaneously, on both producer and consumer threads, across 1 M iterations.
 
 ### Caveats
 
@@ -183,19 +187,21 @@ The hot-path bench is fully self-contained — no exchange, no simulator, no net
 ```bash
 # Build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target bench_hotpath_pipe -j
+cmake --build build --target bench_hotpath_multi -j
 
 # Pick two CPUs on the same physical core complex / shared L3.
 # Inspect topology first:
 lscpu --extended | head -20       # CORE and L3 columns matter
 cat /proc/interrupts | head -20   # avoid CPUs hosting busy IRQs
 
-# Edit CORE_PRODUCER / CORE_CONSUMER in bench/bench_hotpath_pipe.cpp,
+# Edit CORE_PRODUCER / CORE_CONSUMER in bench/bench_hotpath_multi.cpp,
 # rebuild, then run. Add sudo for SCHED_FIFO + mlockall to take effect.
-sudo ./build/bench_hotpath_pipe
+sudo ./build/bench_hotpath_multi             # headline (256-ticker dispatch)
+./build/bench_hotpath_pipe                   # 1-ticker compute floor (compare against)
+./build/bench_hotpath                        # single-thread floor (no queue handoff)
 ```
 
-Output prints min / p50 / p90 / p99 / p99.9 / max in both TSC cycles and nanoseconds, sustained throughput, the zero-allocation PASS/FAIL line, and an ASCII log2-bucket histogram. The raw per-message cycle counts are also dumped to `/tmp/bench_hotpath_pipe_cycles.bin` for offline analysis; [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py) renders the matplotlib histogram shown above.
+Each bench prints min / p50 / p90 / p99 / p99.9 / max in both TSC cycles and nanoseconds, sustained throughput, the zero-allocation PASS/FAIL line, and an ASCII log2-bucket histogram. Raw per-message cycle counts are dumped to `/tmp/bench_hotpath_multi_cycles.bin` (and the 1-ticker variant to `/tmp/bench_hotpath_pipe_cycles.bin`) for offline analysis; [`script/plot_hotpath_hist.py`](script/plot_hotpath_hist.py) renders the matplotlib histogram shown above.
 
 For tightest measurements, prefer:
 - Cores on the **same L3 CCX** (`lscpu --extended`, match the `L3` column).
@@ -302,7 +308,8 @@ Only environment variables change. Point `KALSHI_API_BASE` and `KALSHI_WS_URL` a
 
 ```bash
 # Hot-path pipeline (headline number — see Measured Results)
-sudo ./build/bench_hotpath_pipe        # 2-thread SPSC pipeline, CPU-pinned, SCHED_FIFO + mlockall
+sudo ./build/bench_hotpath_multi       # 256-ticker FlatHashMap + Pool dispatch (headline)
+sudo ./build/bench_hotpath_pipe        # 2-thread SPSC pipeline, 1 ticker (compute floor)
 ./build/bench_hotpath                  # single-thread compute floor (no queue handoff)
 
 # Component microbenchmarks (Google Benchmark)
