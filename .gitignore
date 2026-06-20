@@ -7,3 +7,4 @@ sim/replay/
 *.pem
 *.key
 .kalshi/
+.DS_Store
