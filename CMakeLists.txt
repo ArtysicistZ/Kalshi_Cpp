@@ -135,6 +135,18 @@ add_executable(bench_hotpath_multi
 target_include_directories(bench_hotpath_multi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(bench_hotpath_multi PRIVATE simdjson::simdjson Threads::Threads)
 
+add_executable(bench_hotpath_paced
+    bench/bench_hotpath_paced.cpp
+    src/feed/parser.cpp
+    src/feed/book.cpp
+    src/strategy/signal.cpp
+    src/strategy/order_manager.cpp
+    src/net/serialize.cpp
+    src/system/tuning.cpp
+)
+target_include_directories(bench_hotpath_paced PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_hotpath_paced PRIVATE simdjson::simdjson Threads::Threads)
+
 add_executable(test_matching_engine
     test/test_matching_engine.cpp
     sim/domain/matching_engine.cpp
